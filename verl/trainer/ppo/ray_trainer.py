@@ -217,13 +217,6 @@ def compute_advantage(
         dedup_rewards = data.batch["token_level_rewards"][repr_idx]
         dedup_mask = data.batch["response_mask"][repr_idx]
         dedup_uid = data.non_tensor_batch["uid"][representative_indices] if "uid" in data.non_tensor_batch else None
-
-        print(
-            f"[MultiTrajGroup] compute_advantage: {len(trajectory_group_id)} total trajectories "
-            f"-> {len(representative_indices)} unique groups "
-            f"(dedup for {adv_estimator.value if hasattr(adv_estimator, 'value') else adv_estimator}). "
-            f"All {len(trajectory_group_id)} trajectories will be used for actor training."
-        )
     else:
         dedup_rewards = data.batch["token_level_rewards"]
         dedup_mask = data.batch["response_mask"]
@@ -1443,12 +1436,6 @@ class RayPPOTrainer:
                         # Multi-trajectory expansion: gen_batch_output has more rows than input.
                         # gen_batch_output already contains replicated non_tensor_batch fields
                         # (uid, data_source, reward_model, etc.) from _postprocess via flat_input_indices.
-                        print(
-                            f"[MultiTrajGroup] Batch expansion: expected {input_batch_size} rows, "
-                            f"got {output_batch_size} rows "
-                            f"(+{output_batch_size - input_batch_size} extra trajectories "
-                            f"from multi-trajectory groups). Using gen_batch_output directly."
-                        )
                         batch = gen_batch_output
 
                     if "response_mask" not in batch.batch.keys():

@@ -797,23 +797,13 @@ class AgentLoopWorker:
         flat_input_indices = []  # which original sample each trajectory came from
         flat_group_ids = []  # unique id per rollout group
 
-        multi_traj_groups = 0
         for sample_idx, (traj_list, shared_reward) in enumerate(inputs):
             group_id = str(uuid4())
-            if len(traj_list) > 1:
-                multi_traj_groups += 1
             for traj in traj_list:
                 flat_outputs.append(traj)
                 flat_shared_rewards.append(shared_reward)
                 flat_input_indices.append(sample_idx)
                 flat_group_ids.append(group_id)
-
-        if multi_traj_groups > 0:
-            print(
-                f"[_postprocess] Multi-trajectory groups detected: {multi_traj_groups}/{len(inputs)} "
-                f"rollouts have >1 trajectory. Total trajectories: {len(flat_outputs)} "
-                f"(from {len(inputs)} rollouts). Batch expanded by {len(flat_outputs) - len(inputs)} extra rows."
-            )
 
         # Convert lists back to tensors and stack them to create a batch.
         prompt_ids = torch.cat([output.prompt_ids for output in flat_outputs], dim=0)
