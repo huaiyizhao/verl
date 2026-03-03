@@ -46,7 +46,7 @@ PROJECT_DIR="$(pwd)"
 CONFIG_PATH="$PROJECT_DIR/examples/sglang_multiturn/config"
 
 # Defaults — override via environment variables
-MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen3-VL-8B-Instruct"}
+MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen3-VL-2B-Instruct"}
 DATA_DIR=${DATA_DIR:-"$HOME/data/gsm8k_multi_traj_test"}
 GPUS=${GPUS:-2}
 ADV_ESTIMATOR=${ADV_ESTIMATOR:-grpo}
