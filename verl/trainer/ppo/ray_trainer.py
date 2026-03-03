@@ -66,7 +66,7 @@ from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
-logger = logging.getLogger(__name__)
+_logger = logging.getLogger(__name__)
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -221,7 +221,7 @@ def compute_advantage(
         dedup_mask = data.batch["response_mask"][repr_idx]
         dedup_uid = data.non_tensor_batch["uid"][representative_indices] if "uid" in data.non_tensor_batch else None
 
-        logger.info(
+        _logger.info(
             "[MultiTrajGroup] compute_advantage: %d total trajectories -> %d unique groups (dedup for %s). "
             "All %d trajectories will be used for actor training.",
             len(trajectory_group_id),
@@ -1448,7 +1448,7 @@ class RayPPOTrainer:
                         # Multi-trajectory expansion: gen_batch_output has more rows than input.
                         # gen_batch_output already contains replicated non_tensor_batch fields
                         # (uid, data_source, reward_model, etc.) from _postprocess via flat_input_indices.
-                        logger.info(
+                        _logger.info(
                             "[MultiTrajGroup] Batch expansion: expected %d rows, got %d rows "
                             "(+%d extra trajectories from multi-trajectory groups). "
                             "Using gen_batch_output directly.",
