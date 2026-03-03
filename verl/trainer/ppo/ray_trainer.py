@@ -226,7 +226,7 @@ def compute_advantage(
             "All %d trajectories will be used for actor training.",
             len(trajectory_group_id),
             len(representative_indices),
-            adv_estimator.value,
+            adv_estimator.value if hasattr(adv_estimator, "value") else adv_estimator,
             len(trajectory_group_id),
         )
     else:
