@@ -19,7 +19,6 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
-import logging
 import os
 import uuid
 from collections import defaultdict
@@ -65,8 +64,6 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
-
-_logger = logging.getLogger(__name__)
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -221,13 +218,11 @@ def compute_advantage(
         dedup_mask = data.batch["response_mask"][repr_idx]
         dedup_uid = data.non_tensor_batch["uid"][representative_indices] if "uid" in data.non_tensor_batch else None
 
-        _logger.info(
-            "[MultiTrajGroup] compute_advantage: %d total trajectories -> %d unique groups (dedup for %s). "
-            "All %d trajectories will be used for actor training.",
-            len(trajectory_group_id),
-            len(representative_indices),
-            adv_estimator.value if hasattr(adv_estimator, "value") else adv_estimator,
-            len(trajectory_group_id),
+        print(
+            f"[MultiTrajGroup] compute_advantage: {len(trajectory_group_id)} total trajectories "
+            f"-> {len(representative_indices)} unique groups "
+            f"(dedup for {adv_estimator.value if hasattr(adv_estimator, 'value') else adv_estimator}). "
+            f"All {len(trajectory_group_id)} trajectories will be used for actor training."
         )
     else:
         dedup_rewards = data.batch["token_level_rewards"]
@@ -1457,13 +1452,11 @@ class RayPPOTrainer:
                         # Multi-trajectory expansion: gen_batch_output has more rows than input.
                         # gen_batch_output already contains replicated non_tensor_batch fields
                         # (uid, data_source, reward_model, etc.) from _postprocess via flat_input_indices.
-                        _logger.info(
-                            "[MultiTrajGroup] Batch expansion: expected %d rows, got %d rows "
-                            "(+%d extra trajectories from multi-trajectory groups). "
-                            "Using gen_batch_output directly.",
-                            input_batch_size,
-                            output_batch_size,
-                            output_batch_size - input_batch_size,
+                        print(
+                            f"[MultiTrajGroup] Batch expansion: expected {input_batch_size} rows, "
+                            f"got {output_batch_size} rows "
+                            f"(+{output_batch_size - input_batch_size} extra trajectories "
+                            f"from multi-trajectory groups). Using gen_batch_output directly."
                         )
                         batch = gen_batch_output
 

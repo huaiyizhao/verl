@@ -46,7 +46,7 @@ PROJECT_DIR="$(pwd)"
 CONFIG_PATH="$PROJECT_DIR/examples/sglang_multiturn/config"
 
 # Defaults — override via environment variables
-MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen2.5-0.5B-Instruct"}
+MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen3-VL-8B-Instruct"}
 DATA_DIR=${DATA_DIR:-"$HOME/data/gsm8k_multi_traj_test"}
 GPUS=${GPUS:-2}
 ADV_ESTIMATOR=${ADV_ESTIMATOR:-grpo}
@@ -80,7 +80,7 @@ CMD=(
     algorithm.use_kl_in_reward=False
 
     # Data — small batch for testing
-    data.train_batch_size=64
+    data.train_batch_size=16
     data.max_prompt_length=512
     data.max_response_length=2048
     data.filter_overlong_prompts=True
@@ -96,8 +96,8 @@ CMD=(
 
     # Actor
     actor_rollout_ref.actor.optim.lr=1e-6
-    actor_rollout_ref.actor.ppo_mini_batch_size=64
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8
+    actor_rollout_ref.actor.ppo_mini_batch_size=16
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1
     actor_rollout_ref.actor.use_kl_loss=False
     actor_rollout_ref.actor.entropy_coeff=0
     actor_rollout_ref.actor.fsdp_config.param_offload=False
