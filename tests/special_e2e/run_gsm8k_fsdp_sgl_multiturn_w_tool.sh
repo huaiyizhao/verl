@@ -51,8 +51,8 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=-1 \
-    data.train_files=$HOME/data/gsm8k_verl_sgl_multi_turn_preprocessed/train.parquet \
-    data.val_files=$HOME/data/gsm8k_verl_sgl_multi_turn_preprocessed/test.parquet \
+    data.train_files=$HOME/data/gsm8k/train.parquet \
+    data.val_files=$HOME/data/gsm8k/test.parquet \
     actor_rollout_ref.rollout.multi_turn.tool_config_path="$PROJECT_DIR/examples/sglang_multiturn/config/tool_config/gsm8k_tool_config.yaml" \
     trainer.val_before_train=False \
     trainer.total_training_steps=1 $@
