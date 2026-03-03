@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import logging
 import os
 import uuid
 from collections import defaultdict
@@ -64,6 +65,8 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import FSDPEngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
+logger = logging.getLogger(__name__)
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -217,6 +220,15 @@ def compute_advantage(
         dedup_rewards = data.batch["token_level_rewards"][repr_idx]
         dedup_mask = data.batch["response_mask"][repr_idx]
         dedup_uid = data.non_tensor_batch["uid"][representative_indices] if "uid" in data.non_tensor_batch else None
+
+        logger.info(
+            "[MultiTrajGroup] compute_advantage: %d total trajectories -> %d unique groups (dedup for %s). "
+            "All %d trajectories will be used for actor training.",
+            len(trajectory_group_id),
+            len(representative_indices),
+            adv_estimator.value,
+            len(trajectory_group_id),
+        )
     else:
         dedup_rewards = data.batch["token_level_rewards"]
         dedup_mask = data.batch["response_mask"]
@@ -1436,6 +1448,14 @@ class RayPPOTrainer:
                         # Multi-trajectory expansion: gen_batch_output has more rows than input.
                         # gen_batch_output already contains replicated non_tensor_batch fields
                         # (uid, data_source, reward_model, etc.) from _postprocess via flat_input_indices.
+                        logger.info(
+                            "[MultiTrajGroup] Batch expansion: expected %d rows, got %d rows "
+                            "(+%d extra trajectories from multi-trajectory groups). "
+                            "Using gen_batch_output directly.",
+                            input_batch_size,
+                            output_batch_size,
+                            output_batch_size - input_batch_size,
+                        )
                         batch = gen_batch_output
 
                     if "response_mask" not in batch.batch.keys():
