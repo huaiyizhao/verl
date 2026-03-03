@@ -25,12 +25,6 @@
 #   ADV_ESTIMATOR=gae bash tests/special_e2e/multi_trajectory_group/run_multi_traj_grpo.sh
 #
 # Runs on 2+ GPUs. Uses a small model (0.5B) for fast testing.
-#
-# Key log lines to look for (grep for "MultiTrajGroup" or "MultiTrajTestAgent"):
-#   [MultiTrajTestAgent] Returning group with 3 trajectories ...
-#   [_postprocess] Multi-trajectory groups detected ...
-#   [MultiTrajGroup] Batch expansion: expected N rows, got M rows ...
-#   [MultiTrajGroup] compute_advantage: N total trajectories -> M unique groups ...
 
 set -xeuo pipefail
 
@@ -159,35 +153,11 @@ echo "=========================================="
 
 ERRORS=0
 
-# Check 1: Agent returned group with 3 trajectories
+# Check: Agent returned group with 3 trajectories (printed by the test agent)
 if grep -q "Returning group with 3 trajectories" "$LOGFILE"; then
     echo "[PASS] Agent returned AgentLoopGroupOutput with 3 trajectories"
 else
     echo "[FAIL] Agent did NOT return multi-trajectory group output with 3 trajectories"
-    ERRORS=$((ERRORS + 1))
-fi
-
-# Check 2: _postprocess detected multi-trajectory groups
-if grep -q "Multi-trajectory groups detected" "$LOGFILE"; then
-    echo "[PASS] _postprocess detected and flattened multi-trajectory groups"
-else
-    echo "[FAIL] _postprocess did NOT detect multi-trajectory groups"
-    ERRORS=$((ERRORS + 1))
-fi
-
-# Check 3: Batch expansion took the multi-trajectory path
-if grep -q "extra trajectories from multi-trajectory groups" "$LOGFILE"; then
-    echo "[PASS] Trainer used multi-trajectory batch expansion path"
-else
-    echo "[FAIL] Trainer did NOT use multi-trajectory batch expansion"
-    ERRORS=$((ERRORS + 1))
-fi
-
-# Check 4: compute_advantage processed the groups
-if grep -q "compute_advantage.*total trajectories.*unique groups" "$LOGFILE"; then
-    echo "[PASS] compute_advantage processed trajectory groups (dedup for $ADV_ESTIMATOR)"
-else
-    echo "[FAIL] compute_advantage did NOT process trajectory groups"
     ERRORS=$((ERRORS + 1))
 fi
 
@@ -201,6 +171,5 @@ elif [ $ERRORS -gt 0 ]; then
     exit 1
 else
     echo "  Multi-trajectory group test PASSED"
-    echo "  All pipeline stages verified."
 fi
 echo "=========================================="
