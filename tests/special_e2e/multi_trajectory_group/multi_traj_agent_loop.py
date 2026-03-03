@@ -37,8 +37,6 @@ The reward comes from trajectory 3 (the final answer) and is shared to all 3.
 All trajectories have different prompt/response tokens and are on-policy.
 """
 
-import logging
-import os
 from typing import Any
 from uuid import uuid4
 
@@ -50,9 +48,6 @@ from verl.experimental.agent_loop.agent_loop import (
     register,
 )
 from verl.utils.profiler import simple_timer
-
-logger = logging.getLogger(__file__)
-logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
 @register("multi_traj_test_agent")
@@ -214,17 +209,43 @@ class MultiTrajTestAgentLoop(AgentLoopBase):
             extra_fields={"turn_scores": [], "tool_rewards": [], "trajectory_role": "final"},
         )
 
-        logger.info(
-            "[MultiTrajTestAgent] Returning group with 3 trajectories: "
-            "step1(prompt=%d, response=%d), step2_compress(prompt=%d, response=%d), "
-            "step3_final(prompt=%d, response=%d)",
-            len(prompt_ids),
-            len(response_1_ids),
-            len(prompt_ids),
-            len(step2_full_response_ids),
-            len(prompt_ids),
-            len(step3_full_response_ids),
+        # ---- Detailed trajectory logging ----
+        def _decode_preview(ids, max_chars=200):
+            text = self.tokenizer.decode(ids, skip_special_tokens=True)
+            if len(text) > max_chars:
+                text = text[:max_chars] + "..."
+            return text.replace("\n", "\\n")
+
+        trainable_1 = sum(response_1_mask)
+        trainable_2 = sum(step2_full_response_mask)
+        trainable_3 = sum(step3_full_response_mask)
+
+        print("=" * 80)
+        print("[MultiTrajTestAgent] Returning group with 3 trajectories")
+        print("-" * 80)
+        print("  Trajectory 1 (intermediate - step1):")
+        print(f"    prompt_len={len(prompt_ids)}, response_len={len(response_1_ids)}, trainable_tokens={trainable_1}")
+        print(f"    prompt: {_decode_preview(prompt_ids)}")
+        print(f"    response: {_decode_preview(response_1_ids)}")
+        print("-" * 80)
+        print("  Trajectory 2 (intermediate - compress):")
+        print(
+            f"    prompt_len={len(prompt_ids)}, response_len={len(step2_full_response_ids)}, "
+            f"trainable_tokens={trainable_2} (response_1={len(response_1_ids)} mask=0, "
+            f"compress_instr={len(compress_ids)} mask=0, response_2={len(response_2_ids)} mask=1)"
         )
+        print(f"    prompt: {_decode_preview(prompt_ids)}")
+        print(f"    response (trainable part / response_2): {_decode_preview(response_2_ids)}")
+        print("-" * 80)
+        print("  Trajectory 3 (final):")
+        print(
+            f"    prompt_len={len(prompt_ids)}, response_len={len(step3_full_response_ids)}, "
+            f"trainable_tokens={trainable_3} (response_2={len(response_2_ids)} mask=0, "
+            f"final_instr={len(final_instr_ids)} mask=0, response_3={len(response_3_ids)} mask=1)"
+        )
+        print(f"    prompt: {_decode_preview(prompt_ids)}")
+        print(f"    response (trainable part / response_3): {_decode_preview(response_3_ids)}")
+        print("=" * 80)
 
         return AgentLoopGroupOutput(
             trajectories=[traj_final, traj_step1, traj_step2],

@@ -809,14 +809,10 @@ class AgentLoopWorker:
                 flat_group_ids.append(group_id)
 
         if multi_traj_groups > 0:
-            logger.info(
-                "[_postprocess] Multi-trajectory groups detected: %d/%d rollouts have >1 trajectory. "
-                "Total trajectories: %d (from %d rollouts). Batch expanded by %d extra rows.",
-                multi_traj_groups,
-                len(inputs),
-                len(flat_outputs),
-                len(inputs),
-                len(flat_outputs) - len(inputs),
+            print(
+                f"[_postprocess] Multi-trajectory groups detected: {multi_traj_groups}/{len(inputs)} "
+                f"rollouts have >1 trajectory. Total trajectories: {len(flat_outputs)} "
+                f"(from {len(inputs)} rollouts). Batch expanded by {len(flat_outputs) - len(inputs)} extra rows."
             )
 
         # Convert lists back to tensors and stack them to create a batch.
