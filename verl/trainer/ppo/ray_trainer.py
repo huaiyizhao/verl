@@ -639,8 +639,8 @@ class RayPPOTrainer:
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
 
             # When multi-trajectory agent loops expand the batch (N inputs → N×turns outputs),
-            # we can't union because sizes differ.  Collapse to one row per rollout by keeping
-            # only the final trajectory of each group, so metrics are per-rollout.
+            # we can't union because sizes differ and extra_info arrays are copies.
+            # Collapse to one row per rollout (the final trajectory), then use it directly.
             input_batch_size = len(test_batch)
             output_batch_size = len(test_output_gen_batch)
             if (
@@ -658,10 +658,12 @@ class RayPPOTrainer:
                 keep.sort()
                 test_output_gen_batch = test_output_gen_batch[keep]
                 output_texts = [output_texts[i] for i in keep]
-
+                # Use collapsed output directly — it already has all non_tensor_batch
+                # fields (uid, data_source, reward_model, extra_info, etc.) from _postprocess.
+                test_batch = test_output_gen_batch
+            else:
+                test_batch = test_batch.union(test_output_gen_batch)
             sample_outputs.extend(output_texts)
-
-            test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
 
             # Store original inputs
