@@ -638,23 +638,23 @@ class RayPPOTrainer:
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
 
-            # When multi-trajectory agent loops expand the batch (N inputs → N×turns outputs),
-            # we can't union because sizes differ and extra_info arrays are copies.
-            # Collapse to one row per rollout (the final trajectory), then use it directly.
-            if "trajectory_group_id" in test_output_gen_batch.non_tensor_batch:
-                group_ids = test_output_gen_batch.non_tensor_batch["trajectory_group_id"]
-                # Keep last occurrence of each group (the "final" trajectory)
-                seen = set()
-                keep = []
-                for i in range(len(group_ids) - 1, -1, -1):
-                    if group_ids[i] not in seen:
-                        seen.add(group_ids[i])
-                        keep.append(i)
-                keep.sort()
-                test_output_gen_batch = test_output_gen_batch[keep]
-                output_texts = [output_texts[i] for i in keep]
-                # Use collapsed output directly — it already has all non_tensor_batch
-                # fields (uid, data_source, reward_model, extra_info, etc.) from _postprocess.
+            # Agent loop _postprocess reconstructs non_tensor_batch fields (extra_info, etc.)
+            # which are copies, not the same objects as in test_batch. union() asserts
+            # _deep_equal on overlapping keys, which fails on these copies.
+            # When output already carries all needed fields, use it directly.
+            if "extra_info" in test_output_gen_batch.non_tensor_batch:
+                # Collapse multi-trajectory groups to one row per rollout if needed
+                if "trajectory_group_id" in test_output_gen_batch.non_tensor_batch:
+                    group_ids = test_output_gen_batch.non_tensor_batch["trajectory_group_id"]
+                    seen = set()
+                    keep = []
+                    for i in range(len(group_ids) - 1, -1, -1):
+                        if group_ids[i] not in seen:
+                            seen.add(group_ids[i])
+                            keep.append(i)
+                    keep.sort()
+                    test_output_gen_batch = test_output_gen_batch[keep]
+                    output_texts = [output_texts[i] for i in keep]
                 test_batch = test_output_gen_batch
             else:
                 test_batch = test_batch.union(test_output_gen_batch)
