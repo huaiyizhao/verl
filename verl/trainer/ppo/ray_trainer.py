@@ -641,12 +641,7 @@ class RayPPOTrainer:
             # When multi-trajectory agent loops expand the batch (N inputs → N×turns outputs),
             # we can't union because sizes differ and extra_info arrays are copies.
             # Collapse to one row per rollout (the final trajectory), then use it directly.
-            input_batch_size = len(test_batch)
-            output_batch_size = len(test_output_gen_batch)
-            if (
-                output_batch_size != input_batch_size
-                and "trajectory_group_id" in test_output_gen_batch.non_tensor_batch
-            ):
+            if "trajectory_group_id" in test_output_gen_batch.non_tensor_batch:
                 group_ids = test_output_gen_batch.non_tensor_batch["trajectory_group_id"]
                 # Keep last occurrence of each group (the "final" trajectory)
                 seen = set()
