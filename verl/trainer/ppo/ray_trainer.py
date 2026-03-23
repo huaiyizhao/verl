@@ -641,9 +641,9 @@ class RayPPOTrainer:
             # Agent loop _postprocess reconstructs non_tensor_batch fields (extra_info, etc.)
             # which are copies, not the same objects as in test_batch. union() asserts
             # _deep_equal on overlapping keys, which fails on these copies.
-            # When output already carries all needed fields, use it directly.
-            if "extra_info" in test_output_gen_batch.non_tensor_batch:
-                # Collapse multi-trajectory groups to one row per rollout if needed
+            # Detect agent loop output by __num_turns__ (always set by _postprocess)
+            # and use it directly; collapse multi-trajectory groups if needed.
+            if "__num_turns__" in test_output_gen_batch.non_tensor_batch:
                 if "trajectory_group_id" in test_output_gen_batch.non_tensor_batch:
                     group_ids = test_output_gen_batch.non_tensor_batch["trajectory_group_id"]
                     seen = set()
