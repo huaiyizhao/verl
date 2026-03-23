@@ -603,11 +603,6 @@ class RayPPOTrainer:
                 repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
             )
 
-            ground_truths = [
-                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
-            ]
-            sample_gts.extend(ground_truths)
-
             test_gen_batch = self._get_gen_batch(test_batch)
             test_gen_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
@@ -642,6 +637,28 @@ class RayPPOTrainer:
             # Store generated outputs
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+
+            # When multi-trajectory agent loops expand the batch (N inputs → N×turns outputs),
+            # we can't union because sizes differ.  Collapse to one row per rollout by keeping
+            # only the final trajectory of each group, so metrics are per-rollout.
+            input_batch_size = len(test_batch)
+            output_batch_size = len(test_output_gen_batch)
+            if (
+                output_batch_size != input_batch_size
+                and "trajectory_group_id" in test_output_gen_batch.non_tensor_batch
+            ):
+                group_ids = test_output_gen_batch.non_tensor_batch["trajectory_group_id"]
+                # Keep last occurrence of each group (the "final" trajectory)
+                seen = set()
+                keep = []
+                for i in range(len(group_ids) - 1, -1, -1):
+                    if group_ids[i] not in seen:
+                        seen.add(group_ids[i])
+                        keep.append(i)
+                keep.sort()
+                test_output_gen_batch = test_output_gen_batch[keep]
+                output_texts = [output_texts[i] for i in keep]
+
             sample_outputs.extend(output_texts)
 
             test_batch = test_batch.union(test_output_gen_batch)
@@ -649,10 +666,14 @@ class RayPPOTrainer:
 
             # Store original inputs
             input_ids = test_batch.batch["prompts"]
-            # TODO: Can we keep special tokens except for padding tokens?
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
             sample_uids.extend(test_batch.non_tensor_batch["uid"])
+
+            ground_truths = [
+                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
+            ]
+            sample_gts.extend(ground_truths)
 
             # evaluate using reward_function
             reward_tensor, reward_extra_info = extract_reward(test_batch)

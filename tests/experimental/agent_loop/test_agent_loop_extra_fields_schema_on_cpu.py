@@ -222,7 +222,7 @@ async def test_agent_loop_extra_fields_schema_stable_for_training_concat_on_cpu(
     dummy_worker = type("_DummyWorker", (), {"reward_loop_worker_handles": None})()
     merged = AgentLoopWorker._postprocess(
         dummy_worker,
-        inputs=[internal_a],
+        inputs=[([internal_a], None)],
         input_non_tensor_batch={
             "index": np.array([0], dtype=object),
             "agent_name": np.array(["single_turn_agent"], dtype=object),
