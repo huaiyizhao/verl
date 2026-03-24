@@ -1159,11 +1159,17 @@ class AgentLoopManager:
         )
         output = DataProto.concat(outputs)
 
-        # calculate performance metrics
-        metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]
+        # calculate performance metrics — extract per-worker metrics before overwriting meta_info
+        metrics = [o.meta_info.pop("metrics", []) for o in outputs]
         timing = self._performance_metrics(metrics, output)
 
-        output.meta_info = {"timing": timing, **outputs[0].meta_info}
+        # Preserve concat-merged keys (e.g. group_sizes), add timing, carry over scalar keys from first chunk
+        merged_meta = dict(output.meta_info)
+        merged_meta["timing"] = timing
+        for k, v in outputs[0].meta_info.items():
+            if k not in merged_meta:
+                merged_meta[k] = v
+        output.meta_info = merged_meta
         return output
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
