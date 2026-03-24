@@ -180,19 +180,25 @@ def rollout_trace_attr(
 
 
 def _convert_pil_to_weave_images(obj):
-    """Recursively convert PIL.Image.Image to weave.Image for proper trace rendering."""
-    import weave
+    """Recursively convert Pydantic models to dicts while preserving PIL images.
+
+    Weave natively renders PIL.Image.Image objects in traces, but Pydantic's
+    model_dump() converts them to metadata dicts. This function walks the
+    output structure and serializes BaseModel fields manually so PIL images
+    are kept as-is for weave to render.
+    """
     from PIL import Image as PILImage
 
     if isinstance(obj, PILImage.Image):
-        return weave.Image(obj)
+        return obj
     elif isinstance(obj, dict):
         return {k: _convert_pil_to_weave_images(v) for k, v in obj.items()}
     elif isinstance(obj, list | tuple):
         converted = [_convert_pil_to_weave_images(item) for item in obj]
         return type(obj)(converted) if isinstance(obj, tuple) else converted
     elif isinstance(obj, BaseModel):
-        return _convert_pil_to_weave_images(obj.model_dump())
+        # Walk fields manually instead of model_dump() to preserve PIL images
+        return {k: _convert_pil_to_weave_images(v) for k, v in obj.__dict__.items()}
     return obj
 
 
@@ -213,24 +219,59 @@ def rollout_trace_op(func):
         inputs = dict(bound_args.arguments)
         del inputs["self"]
 
+        async def _decode_with_image_collapse(self, token_ids):
+            """Decode token IDs, collapsing image token spans to [image]."""
+            loop = get_event_loop()
+            image_token_id = None
+            if hasattr(self, "processor") and self.processor is not None:
+                image_token_id = getattr(self.processor, "image_token_id", None)
+            if image_token_id is not None:
+                filtered_ids = []
+                in_image_span = False
+                for tid in token_ids:
+                    if tid == image_token_id:
+                        if not in_image_span:
+                            in_image_span = True
+                            filtered_ids.append(tid)
+                    else:
+                        in_image_span = False
+                        filtered_ids.append(tid)
+                text = await loop.run_in_executor(None, self.tokenizer.decode, filtered_ids)
+                image_token_text = await loop.run_in_executor(None, self.tokenizer.decode, [image_token_id])
+                if image_token_text:
+                    text = text.replace(image_token_text, "[image]")
+                return text
+            return await loop.run_in_executor(None, self.tokenizer.decode, token_ids)
+
         async def add_token2text_single(self, result):
-            """Add token2text for a single result object that has prompt_ids/response_ids."""
-            # Use model_dump() for Pydantic models to get a proper copy,
-            # otherwise vars() returns a reference to internal __dict__ which
-            # can cause serialization issues with MLflow
+            """Add token2text for a single result object that has prompt_ids/response_ids/token_ids."""
             if isinstance(result, BaseModel):
-                _result = result.model_dump()
+                if backend == "mlflow":
+                    _result = result.model_dump()
+                else:
+                    _result = dict(vars(result))
             else:
                 _result = dict(vars(result))
-            loop = get_event_loop()
+
             if hasattr(result, "prompt_ids"):
-                prompt_text = await loop.run_in_executor(None, self.tokenizer.decode, result.prompt_ids)
-                _result["prompt_text"] = prompt_text
+                _result["prompt_text"] = await _decode_with_image_collapse(self, result.prompt_ids)
 
             if hasattr(result, "response_ids"):
-                response_text = await loop.run_in_executor(None, self.tokenizer.decode, result.response_ids)
-                _result["response_text"] = response_text
+                _result["response_text"] = await _decode_with_image_collapse(self, result.response_ids)
+
+            # TokenOutput uses token_ids instead of response_ids
+            if hasattr(result, "token_ids") and not hasattr(result, "response_ids"):
+                _result["response_text"] = await _decode_with_image_collapse(self, result.token_ids)
             return _result
+
+        async def enrich_inputs(self, inputs):
+            """Decode token IDs and preserve PIL images in trace inputs."""
+            if not hasattr(self, "tokenizer") or not hasattr(self.tokenizer, "decode"):
+                return inputs
+            enriched = dict(inputs)
+            if "prompt_ids" in enriched and isinstance(enriched["prompt_ids"], list):
+                enriched["prompt_text"] = await _decode_with_image_collapse(self, enriched["prompt_ids"])
+            return enriched
 
         async def add_token2text(self, result):
             if not hasattr(self, "tokenizer") or not hasattr(self.tokenizer, "decode"):
@@ -243,13 +284,16 @@ def rollout_trace_op(func):
             # contain the per-turn prompt_ids/response_ids
             if hasattr(result, "trajectories"):
                 if isinstance(result, BaseModel):
-                    _result = result.model_dump()
+                    if backend == "mlflow":
+                        _result = result.model_dump()
+                    else:
+                        _result = dict(vars(result))
                 else:
                     _result = dict(vars(result))
                 _result["trajectories"] = [
                     await add_token2text_single(self, traj)
                     if hasattr(traj, "prompt_ids")
-                    else (traj.model_dump() if isinstance(traj, BaseModel) else traj)
+                    else (dict(vars(traj)) if isinstance(traj, BaseModel) else traj)
                     for traj in result.trajectories
                 ]
                 return _result
@@ -261,7 +305,12 @@ def rollout_trace_op(func):
             from weave.trace.context import call_context
 
             cur_attributes = {**call_context.call_attributes.get()}
-            call = tracer.create_call(op=func.__qualname__, inputs=inputs, attributes=cur_attributes)
+            if enable_token2text:
+                trace_inputs = await enrich_inputs(self, inputs)
+                trace_inputs = _convert_pil_to_weave_images(trace_inputs)
+            else:
+                trace_inputs = _convert_pil_to_weave_images(inputs)
+            call = tracer.create_call(op=func.__qualname__, inputs=trace_inputs, attributes=cur_attributes)
             try:
                 result = await func(self, *args, **kwargs)
 
@@ -281,7 +330,11 @@ def rollout_trace_op(func):
             import mlflow
 
             with mlflow.start_span(name=func.__qualname__) as span:
-                span.set_inputs(inputs)
+                if enable_token2text:
+                    trace_inputs = await enrich_inputs(self, inputs)
+                    span.set_inputs(trace_inputs)
+                else:
+                    span.set_inputs(inputs)
                 result = await func(self, *args, **kwargs)
                 if enable_token2text:
                     _result = await add_token2text(self, result)
