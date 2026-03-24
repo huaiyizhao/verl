@@ -278,6 +278,10 @@ class AgentLoopBase(ABC):
         self.server_manager = server_manager
         self.tokenizer = tokenizer
         self.processor = processor
+        # Attach tokenizer/processor to server_manager so rollout_trace_op
+        # can decode token IDs to text in generate() traces.
+        self.server_manager.tokenizer = tokenizer
+        self.server_manager.processor = processor
         self.dataset_cls = dataset_cls
         self.data_config = data_config.config
         self.apply_chat_template_kwargs = self.data_config.get("apply_chat_template_kwargs", {})

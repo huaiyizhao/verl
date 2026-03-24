@@ -85,7 +85,12 @@ class RolloutTraceConfig:
         config.max_samples_per_step_per_worker = max_samples_per_step_per_worker
 
         if backend == "weave":
+            import warnings
+
             import weave
+
+            # Suppress weave's use of deprecated Pydantic V1 __fields__ attribute
+            warnings.filterwarnings("ignore", message=".*__fields__.*deprecated", category=DeprecationWarning)
 
             config.client = weave.init(project_name)
         elif backend == "mlflow":
@@ -277,7 +282,7 @@ def rollout_trace_op(func):
             if not hasattr(self, "tokenizer") or not hasattr(self.tokenizer, "decode"):
                 return result
 
-            if hasattr(result, "prompt_ids"):
+            if hasattr(result, "prompt_ids") or hasattr(result, "token_ids"):
                 return await add_token2text_single(self, result)
 
             # Handle grouped outputs (e.g. AgentLoopGroupOutput) where trajectories
