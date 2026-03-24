@@ -179,6 +179,23 @@ def rollout_trace_attr(
         yield
 
 
+def _convert_pil_to_weave_images(obj):
+    """Recursively convert PIL.Image.Image to weave.Image for proper trace rendering."""
+    import weave
+    from PIL import Image as PILImage
+
+    if isinstance(obj, PILImage.Image):
+        return weave.Image(obj)
+    elif isinstance(obj, dict):
+        return {k: _convert_pil_to_weave_images(v) for k, v in obj.items()}
+    elif isinstance(obj, list | tuple):
+        converted = [_convert_pil_to_weave_images(item) for item in obj]
+        return type(obj)(converted) if isinstance(obj, tuple) else converted
+    elif isinstance(obj, BaseModel):
+        return _convert_pil_to_weave_images(obj.model_dump())
+    return obj
+
+
 def rollout_trace_op(func):
     @functools.wraps(func)
     async def async_wrapper(self, *args, **kwargs):
@@ -196,24 +213,47 @@ def rollout_trace_op(func):
         inputs = dict(bound_args.arguments)
         del inputs["self"]
 
+        async def add_token2text_single(self, result):
+            """Add token2text for a single result object that has prompt_ids/response_ids."""
+            # Use model_dump() for Pydantic models to get a proper copy,
+            # otherwise vars() returns a reference to internal __dict__ which
+            # can cause serialization issues with MLflow
+            if isinstance(result, BaseModel):
+                _result = result.model_dump()
+            else:
+                _result = dict(vars(result))
+            loop = get_event_loop()
+            if hasattr(result, "prompt_ids"):
+                prompt_text = await loop.run_in_executor(None, self.tokenizer.decode, result.prompt_ids)
+                _result["prompt_text"] = prompt_text
+
+            if hasattr(result, "response_ids"):
+                response_text = await loop.run_in_executor(None, self.tokenizer.decode, result.response_ids)
+                _result["response_text"] = response_text
+            return _result
+
         async def add_token2text(self, result):
-            if hasattr(result, "prompt_ids") and hasattr(self, "tokenizer") and hasattr(self.tokenizer, "decode"):
-                # Use model_dump() for Pydantic models to get a proper copy,
-                # otherwise vars() returns a reference to internal __dict__ which
-                # can cause serialization issues with MLflow
+            if not hasattr(self, "tokenizer") or not hasattr(self.tokenizer, "decode"):
+                return result
+
+            if hasattr(result, "prompt_ids"):
+                return await add_token2text_single(self, result)
+
+            # Handle grouped outputs (e.g. AgentLoopGroupOutput) where trajectories
+            # contain the per-turn prompt_ids/response_ids
+            if hasattr(result, "trajectories"):
                 if isinstance(result, BaseModel):
                     _result = result.model_dump()
                 else:
                     _result = dict(vars(result))
-                loop = get_event_loop()
-                if hasattr(result, "prompt_ids"):
-                    prompt_text = await loop.run_in_executor(None, self.tokenizer.decode, result.prompt_ids)
-                    _result["prompt_text"] = prompt_text
-
-                if hasattr(result, "response_ids"):
-                    response_text = await loop.run_in_executor(None, self.tokenizer.decode, result.response_ids)
-                    _result["response_text"] = response_text
+                _result["trajectories"] = [
+                    await add_token2text_single(self, traj)
+                    if hasattr(traj, "prompt_ids")
+                    else (traj.model_dump() if isinstance(traj, BaseModel) else traj)
+                    for traj in result.trajectories
+                ]
                 return _result
+
             return result
 
         if backend == "weave":
@@ -227,9 +267,10 @@ def rollout_trace_op(func):
 
                 if enable_token2text:
                     _result = await add_token2text(self, result)
-                    tracer.finish_call(call, output=_result)
+                    _output = _convert_pil_to_weave_images(_result)
                 else:
-                    tracer.finish_call(call, output=result)
+                    _output = _convert_pil_to_weave_images(result)
+                tracer.finish_call(call, output=_output)
 
                 return result
 
@@ -276,7 +317,8 @@ def rollout_trace_op(func):
             call = tracer.create_call(op=func.__qualname__, inputs=inputs, attributes=cur_attributes)
             try:
                 result = func(self, *args, **kwargs)
-                tracer.finish_call(call, output=result)
+                _output = _convert_pil_to_weave_images(result)
+                tracer.finish_call(call, output=_output)
                 return result
             except Exception as e:
                 tracer.finish_call(call, exception=e)

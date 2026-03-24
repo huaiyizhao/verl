@@ -1467,6 +1467,20 @@ class RayPPOTrainer:
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
+
+                    # Pad batch to be divisible by dp_size for multi-trajectory agent loops
+                    # where the total trajectory count may not divide evenly.
+                    # We duplicate entries from the batch start but zero out their masks
+                    # so padded samples contribute nothing to loss computation.
+                    if self.config.trainer.balance_batch:
+                        dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+                        if len(batch) % dp_size != 0:
+                            orig_len = len(batch)
+                            batch, _ = pad_dataproto_to_divisor(batch, dp_size)
+                            for key in ("attention_mask", "response_mask"):
+                                if key in batch.batch.keys():
+                                    batch.batch[key][orig_len:] = 0
+
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
