@@ -643,7 +643,10 @@ class RayPPOTrainer:
             # _deep_equal on overlapping keys, which fails on these copies.
             # Detect agent loop output by __num_turns__ (always set by _postprocess)
             # and use it directly; collapse multi-trajectory groups if needed.
-            if "__num_turns__" in test_output_gen_batch.non_tensor_batch:
+            is_agent_loop_output = "__num_turns__" in test_output_gen_batch.non_tensor_batch or len(
+                test_output_gen_batch
+            ) != len(test_batch)
+            if is_agent_loop_output:
                 if "trajectory_group_id" in test_output_gen_batch.non_tensor_batch:
                     group_ids = test_output_gen_batch.non_tensor_batch["trajectory_group_id"]
                     seen = set()
