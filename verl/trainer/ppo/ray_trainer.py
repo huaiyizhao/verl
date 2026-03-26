@@ -1483,6 +1483,12 @@ class RayPPOTrainer:
                             for key in ("attention_mask", "response_mask"):
                                 if key in batch.batch.keys():
                                     batch.batch[key][orig_len:] = 0
+                            # Clear multi_modal_inputs for padded entries so their image
+                            # features don't get concatenated when use_remove_padding
+                            # strips the zero-masked image tokens.
+                            if "multi_modal_inputs" in batch.non_tensor_batch:
+                                for i in range(orig_len, len(batch)):
+                                    batch.non_tensor_batch["multi_modal_inputs"][i] = None
 
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
