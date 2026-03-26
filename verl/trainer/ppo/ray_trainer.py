@@ -1471,39 +1471,36 @@ class RayPPOTrainer:
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
 
-                    # Pad batch to be divisible by dp_size for multi-trajectory agent loops
-                    # where the total trajectory count may not divide evenly.
-                    # We duplicate entries from the batch start but zero out their masks
-                    # so padded samples contribute nothing to loss computation.
-                    if self.config.trainer.balance_batch:
-                        dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
-                        if len(batch) % dp_size != 0:
-                            orig_len = len(batch)
-                            batch, _ = pad_dataproto_to_divisor(batch, dp_size)
-                            for key in ("attention_mask", "response_mask"):
-                                if key in batch.batch.keys():
-                                    batch.batch[key][orig_len:] = 0
-                            # Clear multi_modal_inputs for padded entries so their image
-                            # features don't get concatenated when use_remove_padding
-                            # strips the zero-masked image tokens.
-                            if "multi_modal_inputs" in batch.non_tensor_batch:
-                                for i in range(orig_len, len(batch)):
-                                    batch.non_tensor_batch["multi_modal_inputs"][i] = None
-
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
                     # but might affect the loss calculation (due to the change of mini-batching).
                     if self.config.trainer.balance_batch:
-                        self._balance_batch(batch, metrics=metrics)
+                        dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+                        if len(batch) % dp_size == 0:
+                            self._balance_batch(batch, metrics=metrics)
+
+                    # Compute per-trajectory loss weight for multi-trajectory groups.
+                    # Each trajectory is weighted by 1/group_size so each rollout
+                    # contributes equally regardless of how many turns it took.
+                    if "trajectory_group_id" in batch.non_tensor_batch:
+                        from collections import Counter
+
+                        group_ids = batch.non_tensor_batch["trajectory_group_id"]
+                        group_counts = Counter(group_ids)
+                        weights = torch.tensor(
+                            [1.0 / group_counts[gid] for gid in group_ids],
+                            dtype=torch.float32,
+                        )
+                        batch.batch["trajectory_loss_weight"] = weights.unsqueeze(1).expand_as(
+                            batch.batch["response_mask"]
+                        )
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
                     # get images_seqlens
                     images_seqlens_all = []
                     for multi_modal_input in batch.non_tensor_batch["multi_modal_inputs"]:
-                        if multi_modal_input is None:
-                            continue
                         if "image_grid_thw" not in multi_modal_input.keys():
                             continue
                         images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
