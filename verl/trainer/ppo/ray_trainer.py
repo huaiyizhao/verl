@@ -1471,18 +1471,25 @@ class RayPPOTrainer:
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
 
+                    # Pad batch to be divisible by dp_size for multi-trajectory agent loops
+                    # where the total trajectory count may not divide evenly. The duplicated
+                    # entries share the same trajectory_group_id, so the per-group loss weight
+                    # (computed below) auto-adjusts to eliminate bias.
+                    dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+                    if len(batch) % dp_size != 0:
+                        batch, _ = pad_dataproto_to_divisor(batch, dp_size)
+
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
                     # but might affect the loss calculation (due to the change of mini-batching).
                     if self.config.trainer.balance_batch:
-                        dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
-                        if len(batch) % dp_size == 0:
-                            self._balance_batch(batch, metrics=metrics)
+                        self._balance_batch(batch, metrics=metrics)
 
                     # Compute per-trajectory loss weight for multi-trajectory groups.
                     # Each trajectory is weighted by 1/group_size so each rollout
                     # contributes equally regardless of how many turns it took.
+                    # Padding duplicates share the same group_id, so group total = 1.
                     if "trajectory_group_id" in batch.non_tensor_batch:
                         from collections import Counter
 
