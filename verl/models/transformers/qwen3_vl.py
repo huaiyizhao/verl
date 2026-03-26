@@ -151,14 +151,8 @@ def _get_input_embeds(
         n_image_tokens = (input_ids == model.config.image_token_id).sum().item()
         n_image_features = image_embeds.shape[0]
         if n_image_tokens != n_image_features:
-            # Log detailed info to help diagnose the mismatch
-            batch_size = input_ids.shape[0]
-            per_sample_tokens = [(input_ids[i] == model.config.image_token_id).sum().item() for i in range(batch_size)]
             raise ValueError(
-                f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}. "
-                f"batch_size={batch_size}, image_grid_thw={image_grid_thw}, "
-                f"per_sample_image_tokens={per_sample_tokens}, "
-                f"pixel_values.shape={pixel_values.shape}"
+                f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
             )
 
         mask = input_ids == model.config.image_token_id

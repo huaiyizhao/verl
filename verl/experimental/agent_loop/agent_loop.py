@@ -766,55 +766,31 @@ class AgentLoopWorker:
 
         images = output.multi_modal_data.get("images")
         videos = output.multi_modal_data.get("videos")
-
-        if images is None and videos is None:
-            return multi_modal_inputs
-
-        # Count image tokens in input_ids for diagnostic logging
-        image_token_id = getattr(self.processor, "image_token_id", None)
-        if image_token_id is not None:
-            n_image_tokens = (input_ids == image_token_id).sum().item()
-            n_images = len(images) if images else 0
-            logger.info(
-                "[_compute_multi_modal_inputs] n_images=%d, n_image_tokens_in_input_ids=%d, "
-                "image_sizes=%s, input_ids.shape=%s",
-                n_images,
-                n_image_tokens,
-                [img.size if hasattr(img, "size") else "?" for img in (images or [])],
-                input_ids.shape,
-            )
-
-        # Process images/videos directly through the image processor rather than
-        # re-encoding through text (decode → processor(text, images)). The text
-        # re-encoding path uses skip_special_tokens=True which strips vision markers,
-        # causing the processor to miscount images and produce wrong feature counts.
+        # split the videos and according metadatas
         if videos is not None:
             videos, video_metadatas = zip(*videos, strict=False)
             videos, video_metadatas = list(videos), list(video_metadatas)
         else:
             video_metadatas = None
-        multi_modal_inputs = self.processor.image_processor(
+        current_text = self.tokenizer.decode(input_ids.squeeze(0), skip_special_tokens=True)
+        multi_modal_inputs = self.processor(
+            text=[current_text],
             images=images,
             videos=videos,
+            video_metadata=video_metadatas,
             return_tensors="pt",
+            do_sample_frames=False,
         )
         multi_modal_inputs.pop("input_ids", None)
         multi_modal_inputs.pop("attention_mask", None)
 
         # We must use dict(multi_modal_inputs) to convert BatchFeature values to a new dict
         # because np.array() only keeps the keys for BatchFeature.
-        multi_modal_inputs = dict(multi_modal_inputs)
+        multi_modal_inputs = dict(multi_modal_inputs.convert_to_tensors("pt"))
         image_grid_thw = multi_modal_inputs.get("image_grid_thw")
         if image_grid_thw is not None:
             images_seqlens = torch.repeat_interleave(image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0])
             multi_modal_inputs["images_seqlens"] = images_seqlens
-            n_features = images_seqlens.sum().item()
-            logger.info(
-                "[_compute_multi_modal_inputs] image_grid_thw=%s, n_features=%d, pixel_values.shape=%s",
-                image_grid_thw.tolist(),
-                n_features,
-                multi_modal_inputs.get("pixel_values", torch.empty(0)).shape,
-            )
         return multi_modal_inputs
 
     def _compute_position_ids(self, input_ids, attention_mask, multi_modal_inputs) -> torch.Tensor:
