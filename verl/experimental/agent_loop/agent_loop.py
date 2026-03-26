@@ -969,9 +969,11 @@ class AgentLoopWorker:
         # Keep experts
         if flat_outputs[0].routed_experts is not None:
             optional_outputs["routed_experts"] = torch.cat([output.routed_experts for output in flat_outputs], dim=0)
-        if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
-            optional_outputs["teacher_logprobs"] = torch.cat([input.teacher_logprobs for input in inputs], dim=0)
-            optional_outputs["teacher_ids"] = torch.cat([input.teacher_ids for input in inputs], dim=0)
+        if flat_outputs[0].teacher_logprobs is not None and flat_outputs[0].teacher_ids is not None:
+            optional_outputs["teacher_logprobs"] = torch.cat(
+                [output.teacher_logprobs for output in flat_outputs], dim=0
+            )
+            optional_outputs["teacher_ids"] = torch.cat([output.teacher_ids for output in flat_outputs], dim=0)
         batch = TensorDict(
             {
                 "prompts": prompt_ids,  # [bsz, prompt_length]
