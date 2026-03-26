@@ -638,7 +638,7 @@ class AgentLoopWorker:
             # Phase 2: Postprocess ALL trajectories (including reward computation)
             internal_outputs = []
             for traj in group.trajectories:
-                internal_out = await self._agent_loop_postprocess(traj, **kwargs)
+                internal_out = await self._agent_loop_postprocess(traj, validate=trajectory["validate"], **kwargs)
                 internal_outputs.append(internal_out)
 
             # Phase 3: Compute shared_reward for the group
