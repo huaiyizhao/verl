@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import json
+import math
 import os
 import uuid
 from collections import defaultdict
@@ -1536,13 +1537,16 @@ class RayPPOTrainer:
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
 
-                    # Pad batch to be divisible by dp_size for multi-trajectory agent loops
-                    # where the total trajectory count may not divide evenly. The duplicated
-                    # entries share the same trajectory_group_id, so the per-group loss weight
-                    # (computed below) auto-adjusts to eliminate bias.
+                    # Pad batch to be divisible by dp_size and ppo_mini_batch_size for
+                    # multi-trajectory agent loops where the total trajectory count may not
+                    # divide evenly. The duplicated entries share the same trajectory_group_id,
+                    # so the per-group loss weight (computed below) auto-adjusts to eliminate bias.
                     dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
-                    if len(batch) % dp_size != 0:
-                        batch, _ = pad_dataproto_to_divisor(batch, dp_size)
+                    ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+                    # LCM of dp_size and ppo_mini_batch_size ensures both constraints are met
+                    size_divisor = math.lcm(dp_size, ppo_mini_batch_size)
+                    if len(batch) % size_divisor != 0:
+                        batch, _ = pad_dataproto_to_divisor(batch, size_divisor)
 
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
