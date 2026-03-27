@@ -1537,14 +1537,17 @@ class RayPPOTrainer:
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
 
-                    # Pad batch to be divisible by dp_size and ppo_mini_batch_size for
+                    # Pad batch to be divisible by the effective mini-batch size for
                     # multi-trajectory agent loops where the total trajectory count may not
                     # divide evenly. The duplicated entries share the same trajectory_group_id,
                     # so the per-group loss weight (computed below) auto-adjusts to eliminate bias.
+                    # Training multiplies ppo_mini_batch_size by rollout.n (see _update_actor line 1332),
+                    # so we must use the same effective size here.
                     dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
                     ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
-                    # LCM of dp_size and ppo_mini_batch_size ensures both constraints are met
-                    size_divisor = math.lcm(dp_size, ppo_mini_batch_size)
+                    rollout_n = self.config.actor_rollout_ref.rollout.n
+                    effective_mbs = ppo_mini_batch_size * rollout_n
+                    size_divisor = math.lcm(dp_size, effective_mbs)
                     if len(batch) % size_divisor != 0:
                         batch, _ = pad_dataproto_to_divisor(batch, size_divisor)
 
