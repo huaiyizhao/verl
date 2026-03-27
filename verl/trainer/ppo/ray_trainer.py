@@ -1523,6 +1523,10 @@ class RayPPOTrainer:
                         # Multi-trajectory expansion: gen_batch_output has more rows than input.
                         # gen_batch_output already contains replicated non_tensor_batch fields
                         # (uid, data_source, reward_model, etc.) from _postprocess via flat_input_indices.
+                        # Carry over meta_info from original batch (temperature, multi_turn, etc.)
+                        gen_batch_output.meta_info.update(
+                            {k: v for k, v in batch.meta_info.items() if k not in gen_batch_output.meta_info}
+                        )
                         batch = gen_batch_output
                     if self._should_compute_teacher_colocate(batch):
                         with marked_timer("teacher", timing_raw, color="cyan"):
