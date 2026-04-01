@@ -588,8 +588,24 @@ class AgentLoopWorker:
             )
         outputs = await asyncio.gather(*tasks)
 
+        # Filter out failed rollouts (None) and their corresponding input indices
+        valid_indices = [i for i, o in enumerate(outputs) if o is not None]
+        if not valid_indices:
+            raise RuntimeError("[AgentLoopWorker] All rollouts in this batch failed — no valid outputs")
+
+        if len(valid_indices) < len(outputs):
+            logger.warning(
+                "[AgentLoopWorker] Discarded %d/%d failed rollouts",
+                len(outputs) - len(valid_indices),
+                len(outputs),
+            )
+            outputs = [outputs[i] for i in valid_indices]
+            filtered_non_tensor_batch = {k: v[valid_indices] for k, v in batch.non_tensor_batch.items()}
+        else:
+            filtered_non_tensor_batch = batch.non_tensor_batch
+
         output = self._postprocess(
-            outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)
+            outputs, input_non_tensor_batch=filtered_non_tensor_batch, validate=batch.meta_info.get("validate", False)
         )
         return output
 
@@ -601,7 +617,7 @@ class AgentLoopWorker:
         agent_name: str,
         trace: bool = True,
         **kwargs,
-    ) -> tuple[list[_InternalAgentLoopOutput], Optional[float]]:
+    ) -> tuple[list[_InternalAgentLoopOutput], Optional[float]] | None:
         with rollout_trace_attr(
             step=trajectory["step"],
             sample_index=trajectory["sample_index"],
@@ -614,37 +630,53 @@ class AgentLoopWorker:
                 f"Agent loop {agent_name} not registered, registered agent loops: {_agent_loop_registry.keys()}"
             )
 
-            agent_loop_config = _agent_loop_registry[agent_name]
-            agent_loop = hydra.utils.instantiate(
-                config=agent_loop_config,
-                trainer_config=DictConfigWrap(config=self.config),
-                server_manager=self.server_manager,
-                tokenizer=self.tokenizer,
-                processor=self.processor,
-                dataset_cls=self.dataset_cls,
-                data_config=DictConfigWrap(self.config.data),
-            )
-            raw_output = await agent_loop.run(sampling_params, **kwargs)
+            try:
+                agent_loop_config = _agent_loop_registry[agent_name]
+                agent_loop = hydra.utils.instantiate(
+                    config=agent_loop_config,
+                    trainer_config=DictConfigWrap(config=self.config),
+                    server_manager=self.server_manager,
+                    tokenizer=self.tokenizer,
+                    processor=self.processor,
+                    dataset_cls=self.dataset_cls,
+                    data_config=DictConfigWrap(self.config.data),
+                )
+                raw_output = await agent_loop.run(sampling_params, **kwargs)
 
-            # Phase 1: Normalize to group
-            if isinstance(raw_output, AgentLoopGroupOutput):
-                group = raw_output
-            else:
-                # Backward compat: single trajectory -> single-element group
-                group = AgentLoopGroupOutput(trajectories=[raw_output])
+                # Agent loop returned None → discard this rollout
+                if raw_output is None:
+                    logger.warning(
+                        "[AgentLoopWorker] Agent loop returned None (sample_index=%s), discarding rollout",
+                        trajectory["sample_index"],
+                    )
+                    return None
 
-            assert len(group.trajectories) > 0, "AgentLoopGroupOutput must have at least one trajectory"
+                # Phase 1: Normalize to group
+                if isinstance(raw_output, AgentLoopGroupOutput):
+                    group = raw_output
+                else:
+                    # Backward compat: single trajectory -> single-element group
+                    group = AgentLoopGroupOutput(trajectories=[raw_output])
 
-            # Phase 2: Postprocess ALL trajectories (including reward computation)
-            internal_outputs = []
-            for traj in group.trajectories:
-                internal_out = await self._agent_loop_postprocess(traj, validate=trajectory["validate"], **kwargs)
-                internal_outputs.append(internal_out)
+                assert len(group.trajectories) > 0, "AgentLoopGroupOutput must have at least one trajectory"
 
-            # Phase 3: Compute shared_reward for the group
-            shared_reward = self._compute_group_reward(group, internal_outputs)
+                # Phase 2: Postprocess ALL trajectories (including reward computation)
+                internal_outputs = []
+                for traj in group.trajectories:
+                    internal_out = await self._agent_loop_postprocess(traj, validate=trajectory["validate"], **kwargs)
+                    internal_outputs.append(internal_out)
 
-            return (internal_outputs, shared_reward)
+                # Phase 3: Compute shared_reward for the group
+                shared_reward = self._compute_group_reward(group, internal_outputs)
+
+                return (internal_outputs, shared_reward)
+            except Exception as exc:
+                logger.exception(
+                    "[AgentLoopWorker] Agent loop failed (sample_index=%s), discarding rollout: %s",
+                    trajectory["sample_index"],
+                    exc,
+                )
+                return None
 
     def _compute_group_reward(
         self,
