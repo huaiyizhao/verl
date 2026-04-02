@@ -461,7 +461,16 @@ def index_select_tensor_dict(batch: TensorDict, indices: torch.Tensor | list[int
             if isinstance(tensor, torch.Tensor) and not tensor.is_nested:
                 data_dict[key] = tensor[indices]
             elif isinstance(tensor, torch.Tensor) and tensor.is_nested:
-                tensor_lst = tensor.unbind()  # for performance
+                try:
+                    tensor_lst = tensor.unbind()  # for performance
+                except RuntimeError:
+                    # Fallback for 3D+ nested tensors where unbind() fails due to
+                    # corrupted _ragged_idx metadata after Ray serialization.
+                    # See https://github.com/pytorch/pytorch/issues/153238
+                    padded = tensor.to_padded_tensor(0)
+                    offsets = tensor.offsets()
+                    lengths = offsets.diff().tolist()
+                    tensor_lst = [padded[j, ..., :seq_len] for j, seq_len in enumerate(lengths)]
                 data_dict[key] = torch.nested.as_nested_tensor(
                     [tensor_lst[idx] for idx in indices], layout=torch.jagged
                 )
