@@ -164,7 +164,9 @@ def nested_tensor_from_tensor_list(tensors: list[torch.Tensor], ragged_idx: int 
     sample_dim = tensors[0].dim()
     if ragged_idx is None:
         ragged_idx = sample_dim
-    assert ragged_idx == sample_dim, f"Only last-dimension ragged tensors are supported. Got {ragged_idx=} and {sample_dim=}"
+    assert ragged_idx == sample_dim, (
+        f"Only last-dimension ragged tensors are supported. Got {ragged_idx=} and {sample_dim=}"
+    )
 
     if sample_dim == 1:
         return torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
