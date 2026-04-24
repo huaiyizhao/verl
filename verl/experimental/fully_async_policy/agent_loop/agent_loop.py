@@ -147,6 +147,9 @@ class FullyAsyncAgentLoopWorker(AgentLoopWorker):
             teacher_load_balancer_handle,
             reward_loop_worker_handles,
         )
+        # Expose tokenizer on server_manager so that @rollout_trace_op's
+        # add_token2text can decode prompt_ids / token_ids into readable text.
+        self.server_manager.tokenizer = self.tokenizer
 
 
 class FullyAsyncAgentLoopManager(AgentLoopManager):
