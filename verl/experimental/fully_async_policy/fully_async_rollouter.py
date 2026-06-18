@@ -246,7 +246,16 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # `_resume_event` signals that the rollouter is currently running (paused == False).
         self._resume_event = asyncio.Event()
         self._resume_event.set()
-        self.image_refs_postprocess_semaphore = asyncio.Semaphore(1)
+        # Allow several trajectories to run image-ref postprocessing concurrently.
+        # The heavy work (PNG-free hashing, HF image preprocessing, ray.put) is
+        # mostly GIL-releasing C/torch code, so cross-sample concurrency lets it
+        # use multiple cores instead of serializing finished trajectories behind a
+        # single slot (which made postprocess_tasks pile up and starve the trainer).
+        # Keep this modest: each sample already fans out IMAGE_REF_PROCESS_WORKERS
+        # threads internally, so N here multiplies that. Tune jointly; watch memory
+        # since each in-flight bank of processed tensors stays resident.
+        postprocess_concurrency = max(1, int(os.getenv("IMAGE_REF_POSTPROCESS_CONCURRENCY", "4")))
+        self.image_refs_postprocess_semaphore = asyncio.Semaphore(postprocess_concurrency)
 
     async def set_message_queue_client(self, message_queue_client: MessageQueueClient):
         """Set message queue client"""

@@ -461,7 +461,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 # as a top-level actor argument and was auto-dereferenced by Ray.
                 materialized_samples.append(sample)
         if sample_refs:
-            resolved_samples = ray.get(sample_refs)
+            # Await the ObjectRefs instead of a blocking ``ray.get`` so the
+            # trainer's asyncio event loop is not stalled while (potentially
+            # large, image-bearing) samples are fetched from the object store.
+            resolved_samples = await asyncio.gather(*sample_refs)
             for position, resolved_sample in zip(sample_ref_positions, resolved_samples, strict=True):
                 materialized_samples[position] = resolved_sample
         queue_samples = materialized_samples

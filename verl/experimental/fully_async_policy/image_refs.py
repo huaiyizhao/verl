@@ -99,11 +99,14 @@ def _canonicalize_image(image: Any) -> tuple[Image.Image, bytes, str, tuple[int,
     pil_image = _to_pil_image(image)
     if pil_image.mode not in ("RGB", "RGBA", "L"):
         pil_image = pil_image.convert("RGB")
-    buffer = io.BytesIO()
-    pil_image.save(buffer, format="PNG")
-    data = buffer.getvalue()
     mode = pil_image.mode
     size = tuple(pil_image.size)
+    # Hash the raw (uncompressed) pixel buffer instead of re-encoding to PNG.
+    # PNG compression here was pure CPU overhead: ``data`` is only used to derive
+    # the content hash and a raw-bytes stat, and is never stored. ``tobytes()`` is
+    # a cheap copy of the already-decoded buffer and yields an equally valid
+    # content key for dedup.
+    data = pil_image.tobytes()
     digest = hashlib.sha1()
     digest.update(mode.encode("utf-8"))
     digest.update(str(size).encode("utf-8"))
