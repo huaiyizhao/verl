@@ -294,6 +294,31 @@ def assemble_batch_from_rollout_samples(
         image_bank_stats["image_refs/unique_images"], 1
     )
 
+    # Postprocess timing (milliseconds), present only when image_refs is enabled.
+    # postprocess_task_ms is the full per-sample postprocess wall time INCLUDING the
+    # image-refs semaphore wait + to_thread attach (the thing the Semaphore size
+    # controls); build_ms / bank_ref_put_ms break it down (HF image processing /
+    # ray.put of the bank). Keys are NOT prefixed with ``timing_s/`` so the
+    # MetricsAggregator aggregates them as mean/max rather than summing across the
+    # two updates in a param-sync window.
+    def _image_bank_ms(field: str) -> list[float]:
+        out = []
+        for rs in rollout_samples:
+            v = getattr(rs, "image_bank_stats", {}).get(field)
+            if v is not None:
+                out.append(float(v))
+        return out
+
+    for stat_field, label in (
+        ("postprocess_task_ms", "postprocess_ms"),
+        ("build_ms", "build_ms"),
+        ("bank_ref_put_ms", "bank_put_ms"),
+    ):
+        vals = _image_bank_ms(stat_field)
+        if vals:
+            image_bank_stats[f"image_refs/{label}/mean"] = float(np.mean(vals))
+            image_bank_stats[f"image_refs/{label}/max"] = float(np.max(vals))
+
     param_version_start = final_batch.non_tensor_batch["min_global_steps"]
     param_version_end = final_batch.non_tensor_batch["max_global_steps"]
     param_version_diff = [abs(a - b) for a, b in zip(param_version_end, param_version_start, strict=False)]
