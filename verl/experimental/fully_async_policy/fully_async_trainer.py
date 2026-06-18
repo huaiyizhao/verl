@@ -527,7 +527,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         self.progress_bar.close()
         if self.current_param_version % self.config.trainer.test_freq != 0 or self.local_trigger_step > 1:
-            await self._fit_update_weights()
+            weights_updated = await self._fit_update_weights()
+            if weights_updated:
+                self._fit_log_aggregated_training_metrics()
             await self._fit_validate()
         self._fit_save_checkpoint(force=True)
 
@@ -633,7 +635,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             batch = self._fit_update_actor(batch)
             self._log_batch_storage("after_update_actor", batch)
             self._fit_update_local_step()
-            await self._fit_update_weights()
+            weights_updated = await self._fit_update_weights()
             self._log_batch_storage("after_param_sync", batch)
             self._fit_dump_data(batch)
 
@@ -641,6 +643,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self._fit_save_checkpoint()
         self._fit_stop_profile()
         self._fit_collect_metrics(batch)
+        if weights_updated:
+            self._fit_log_aggregated_training_metrics()
         self._fit_postprocess_step()
 
     async def _fit_generate(self, batch: DataProto = None) -> DataProto | None:
@@ -965,7 +969,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
     async def _fit_update_weights(self):
         if self.local_trigger_step != 1:
-            return
+            return False
 
         with marked_timer("timing_s/param_sync", self.timing_raw):
             await self.checkpoint_manager.update_weights(global_steps=self.current_param_version)
@@ -982,11 +986,15 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             step=self.current_param_version,
         )
 
-        # Log aggregated training metrics
-        self.logger.log(
-            data=self.metrics_aggregator.get_aggregated_metrics(),
-            step=self.current_param_version,
-        )
+        return True
+
+    def _fit_log_aggregated_training_metrics(self):
+        aggregated_metrics = self.metrics_aggregator.get_aggregated_metrics()
+        if aggregated_metrics:
+            self.logger.log(
+                data=aggregated_metrics,
+                step=self.current_param_version,
+            )
         self.metrics_aggregator.reset()
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
