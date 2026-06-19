@@ -19,13 +19,16 @@ from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 from verl.trainer.ppo.utils import Role, need_reference_policy
 
 
-def create_resource_pool_manager(config, roles: list) -> ResourcePoolManager:
+def create_resource_pool_manager(config, roles: list, node_resource: str | None = None) -> ResourcePoolManager:
     """
     Create resource pool manager
 
     Args:
         config: Configuration object
         roles: List of roles that need to create resource pools
+        node_resource: Optional custom Ray resource name. When set, all pools in
+            the returned manager pin to nodes advertising it (used to confine the
+            trainer to dedicated nodes in disaggregated topologies).
 
     Returns:
         ResourcePoolManager: Resource pool manager
@@ -66,7 +69,7 @@ def create_resource_pool_manager(config, roles: list) -> ResourcePoolManager:
         resource_pool_spec["teacher_pool"] = teacher_pool
         mapping[Role.TeacherModel] = "teacher_pool"
 
-    return ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
+    return ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping, node_resource=node_resource)
 
 
 def create_role_worker_mapping(config):

@@ -118,6 +118,7 @@ class RayResourcePool(ResourcePool):
         max_colocate_count: int = 10,
         detached=False,
         accelerator_type: Optional[str] = None,
+        node_resource: Optional[str] = None,
     ) -> None:
         super().__init__(process_on_nodes, max_colocate_count)
         self.use_gpu = use_gpu
@@ -126,6 +127,12 @@ class RayResourcePool(ResourcePool):
         self.pgs = None
         self.detached = detached
         self.accelerator_type = accelerator_type
+        # Optional custom resource name. When set, every bundle additionally
+        # requests a tiny amount of it, which pins the whole placement group to
+        # nodes tagged with that resource (`ray start --resources=...`). Used to
+        # confine rollout vs training GPUs to dedicated nodes in disaggregated
+        # (one node rollout / one node train) topologies.
+        self.node_resource = node_resource
 
     def get_placement_groups(self, strategy="STRICT_PACK", name=None, device_name="cuda"):
         if self.pgs is not None:
@@ -145,6 +152,10 @@ class RayResourcePool(ResourcePool):
             bundle[device_name] = 1
             if self.accelerator_type is not None:
                 bundle[self.accelerator_type] = 1e-4
+        if self.node_resource:
+            # Tiny request -> acts purely as a node selector (the tagged node
+            # advertises a large quantity), so it never starves co-scheduled PGs.
+            bundle[self.node_resource] = 0.001
         pg_scheme = [[bundle.copy() for _ in range(process_count)] for process_count in self._store]
 
         lifetime = "detached" if self.detached else None
@@ -188,6 +199,10 @@ class ResourcePoolManager:
     mapping: dict[int, str]
     max_colocate_count: int = 3
     resource_pool_dict: dict[str, RayResourcePool] = field(default_factory=dict)
+    # When set, all pools in this manager pin to nodes advertising this custom
+    # resource (see RayResourcePool.node_resource). Used to confine a role
+    # (e.g. trainer) to dedicated nodes in disaggregated topologies.
+    node_resource: Optional[str] = None
 
     def create_resource_pool(self):
         """Create Ray resource pools for distributed training.
@@ -207,6 +222,7 @@ class ResourcePoolManager:
                 use_gpu=True,
                 max_colocate_count=self.max_colocate_count,
                 name_prefix=resource_pool_name,
+                node_resource=self.node_resource,
             )
             self.resource_pool_dict[resource_pool_name] = resource_pool
 

@@ -199,10 +199,19 @@ class RolloutReplica(ABC):
         resource_pool_spec = {
             resource_pool_name: [self.gpus_per_replica_node] * self.nnodes,
         }
+        # In disaggregated topologies, pin the actual rollout (vLLM) GPUs to the
+        # node(s) tagged with VERL_ROLLOUT_NODE_RESOURCE. With TP=1 each replica
+        # is an independent 1-GPU placement group that would otherwise scatter
+        # across all nodes (and can even starve the trainer's STRICT_PACK pool).
+        # Reward/teacher pools are left unpinned. No-op when the env is unset.
+        rollout_node_resource = os.getenv("VERL_ROLLOUT_NODE_RESOURCE") or None
+        if self.is_reward_model or self.is_teacher_model:
+            rollout_node_resource = None
         resource_pool_manager = ResourcePoolManager(
             resource_pool_spec=resource_pool_spec,
             mapping=None,
             max_colocate_count=2,
+            node_resource=rollout_node_resource,
         )
         resource_pool_manager.create_resource_pool()
         self.resource_pool = resource_pool_manager.resource_pool_dict[resource_pool_name]

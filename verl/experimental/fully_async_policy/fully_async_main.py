@@ -127,7 +127,16 @@ class FullyAsyncTaskRunner:
         resource_pool_manager = create_resource_pool_manager(config, roles=rollouter_roles)
         resource_pool_manager.create_resource_pool()
 
-        rollouter = FullyAsyncRollouter.remote(
+        # Disaggregated placement: pin the rollouter actor (which does the
+        # `ray.put` of image banks, so the banks live on whatever node it runs)
+        # to the rollout-tagged node. No-op when VERL_ROLLOUT_NODE_RESOURCE is
+        # unset. The tiny request acts purely as a node selector.
+        rollout_node_resource = os.getenv("VERL_ROLLOUT_NODE_RESOURCE") or None
+        rollouter_cls = FullyAsyncRollouter
+        if rollout_node_resource:
+            rollouter_cls = FullyAsyncRollouter.options(resources={rollout_node_resource: 0.001})
+
+        rollouter = rollouter_cls.remote(
             config=config,
             tokenizer=self.components["tokenizer"],
             role_worker_mapping=None,
@@ -155,7 +164,11 @@ class FullyAsyncTaskRunner:
             config=config,
             tokenizer=self.components["tokenizer"],
             role_worker_mapping=trainer_role_mapping,
-            resource_pool_manager=create_resource_pool_manager(config, roles=list(trainer_role_mapping.keys())),
+            resource_pool_manager=create_resource_pool_manager(
+                config,
+                roles=list(trainer_role_mapping.keys()),
+                node_resource=os.getenv("VERL_TRAIN_NODE_RESOURCE") or None,
+            ),
             ray_worker_group_cls=self.components["ray_worker_group_cls"],
             processor=self.components["processor"],
             device_name=config.trainer.device,
