@@ -18,6 +18,7 @@ The concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP)
 import gc
 import logging
 import os
+import time
 import warnings
 from collections import OrderedDict
 from contextlib import nullcontext
@@ -156,6 +157,31 @@ class FSDPEngine(BaseEngine):
             if self.engine_config.use_torch_compile  #  use torch compile by default
             else entropy_from_logits
         )
+
+    def _timing_log_enabled(self) -> bool:
+        value = os.getenv("VERL_TRAIN_TIMING_LOG", "0").strip().lower()
+        return value in {"1", "true", "yes", "on"}
+
+    def _timing_log_rank_enabled(self) -> bool:
+        ranks = os.getenv("VERL_TRAIN_TIMING_RANKS", "0").strip().lower()
+        if ranks in {"all", "*"}:
+            return True
+        if not ranks:
+            return self.rank == 0
+        try:
+            allowed = {int(part.strip()) for part in ranks.split(",") if part.strip()}
+        except ValueError:
+            allowed = {0}
+        return self.rank in allowed
+
+    def _timing_stage_name(self, data: TensorDict, forward_only: bool) -> str:
+        stage = tu.get_non_tensor_data(data=data, key="verl_stage", default=None)
+        if stage:
+            return str(stage)
+        return "forward_only" if forward_only else "train"
+
+    def _log_train_timing(self, message: str) -> None:
+        print(f"[FSDPEngine][TrainTiming] {message}", flush=True)
 
     @property
     def is_param_offload_enabled(self) -> bool:
@@ -653,6 +679,9 @@ class FSDPEngine(BaseEngine):
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> list[TensorDict]:
         # note that the global_batch_size should include data on all the dp
         tu.assign_non_tensor(data, sp_size=self.ulysses_sequence_parallel_size)
+        timing_enabled = self._timing_log_enabled() and self._timing_log_rank_enabled()
+        call_start = time.perf_counter() if timing_enabled else None
+        stage_name = self._timing_stage_name(data, forward_only) if timing_enabled else None
 
         dp_size = self.get_data_parallel_size()
         dp_group = self.get_data_parallel_group()
@@ -663,9 +692,16 @@ class FSDPEngine(BaseEngine):
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
         tu.assign_non_tensor(data, dp_size=dp_size)
 
+        prepare_micro_start = time.perf_counter() if timing_enabled else None
         micro_batches, indices = prepare_micro_batches(data=data, dp_group=dp_group, same_micro_num_in_dp=True)
+        prepare_micro_s = time.perf_counter() - prepare_micro_start if timing_enabled else 0.0
 
         output_lst = []
+        micro_timing_lst = []
+        forward_total_s = 0.0
+        backward_total_s = 0.0
+        micro_forward_max_s = 0.0
+        micro_backward_max_s = 0.0
 
         ctx = torch.no_grad() if forward_only else nullcontext()
 
@@ -674,21 +710,64 @@ class FSDPEngine(BaseEngine):
         scaler = getattr(self, "scaler", None)
 
         for micro_batch_idx, micro_batch in enumerate(micro_batches):
+            forward_start = time.perf_counter() if timing_enabled else None
             with ctx:
                 loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
+                if timing_enabled:
+                    forward_s = time.perf_counter() - forward_start
+                    forward_total_s += forward_s
+                    micro_forward_max_s = max(micro_forward_max_s, forward_s)
+                    timing = meta_info.pop("_engine_timing", None)
+                    if timing is not None:
+                        micro_timing_lst.append(timing)
 
                 if not forward_only:
+                    backward_start = time.perf_counter() if timing_enabled else None
                     if scaler is not None:
                         scaler.scale(loss).backward()
                     else:
                         loss.backward()
+                    if timing_enabled:
+                        backward_s = time.perf_counter() - backward_start
+                        backward_total_s += backward_s
+                        micro_backward_max_s = max(micro_backward_max_s, backward_s)
 
             output_lst.append(meta_info)
 
+        postprocess_start = time.perf_counter() if timing_enabled else None
         result = postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
+        postprocess_s = time.perf_counter() - postprocess_start if timing_enabled else 0.0
         bank_cache = getattr(self, "_image_ref_bank_cache", None)
         if bank_cache is not None:
             bank_cache.clear()
+        if timing_enabled:
+            total_s = time.perf_counter() - call_start
+            to_device_s = sum(float(t.get("to_device_s", 0.0)) for t in micro_timing_lst)
+            prepare_inputs_s = sum(float(t.get("prepare_model_inputs_s", 0.0)) for t in micro_timing_lst)
+            resolve_mm_s = sum(float(t.get("resolve_multi_modal_refs_s", 0.0)) for t in micro_timing_lst)
+            model_forward_s = sum(float(t.get("model_forward_s", 0.0)) for t in micro_timing_lst)
+            prepare_outputs_s = sum(float(t.get("prepare_model_outputs_s", 0.0)) for t in micro_timing_lst)
+            loss_s = sum(float(t.get("loss_s", 0.0)) for t in micro_timing_lst)
+            loss_item_s = sum(float(t.get("loss_item_s", 0.0)) for t in micro_timing_lst)
+            rows = int(data.shape[0]) if len(data.shape) > 0 else 0
+            global_tokens = int(batch_num_tokens.item())
+            try:
+                dp_rank = self.get_data_parallel_rank()
+            except Exception:
+                dp_rank = -1
+            self._log_train_timing(
+                f"stage={stage_name} pid={os.getpid()} rank={self.rank} dp_rank={dp_rank} "
+                f"forward_only={forward_only} rows={rows} micro_batches={len(micro_batches)} "
+                f"global_tokens={global_tokens} total_s={total_s:.3f} "
+                f"prepare_micro_s={prepare_micro_s:.3f} forward_step_s={forward_total_s:.3f} "
+                f"backward_s={backward_total_s:.3f} postprocess_s={postprocess_s:.3f} "
+                f"to_device_s={to_device_s:.3f} prepare_inputs_s={prepare_inputs_s:.3f} "
+                f"resolve_mm_s={resolve_mm_s:.3f} "
+                f"model_forward_s={model_forward_s:.3f} prepare_outputs_s={prepare_outputs_s:.3f} "
+                f"loss_s={loss_s:.3f} loss_item_s={loss_item_s:.3f} "
+                f"micro_forward_max_s={micro_forward_max_s:.3f} "
+                f"micro_backward_max_s={micro_backward_max_s:.3f}"
+            )
         return result
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
@@ -969,12 +1048,18 @@ class FSDPEngineWithLMHead(FSDPEngine):
         bank_cache = getattr(self, "_image_ref_bank_cache", None)
         if bank_cache is None:
             bank_cache = self._image_ref_bank_cache = OrderedDict()
+        timing_enabled = self._timing_log_enabled() and self._timing_log_rank_enabled()
+        resolve_start = time.perf_counter() if timing_enabled else None
         multi_modal_inputs = resolve_multi_modal_refs(
             micro_batch,
             self.model_config.tokenizer,
             self.model_config.processor,
             bank_cache=bank_cache,
         )
+        if timing_enabled:
+            self._last_prepare_model_inputs_timing = {
+                "resolve_multi_modal_refs_s": time.perf_counter() - resolve_start,
+            }
         max_bank_cache_size = int(os.getenv("VERL_IMAGE_REF_BANK_CACHE_SIZE", "8"))
         while max_bank_cache_size >= 0 and len(bank_cache) > max_bank_cache_size:
             bank_cache.popitem(last=False)
@@ -1274,9 +1359,15 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
         device_name = get_device_name()
+        timing_enabled = self._timing_log_enabled() and self._timing_log_rank_enabled()
+        to_device_start = time.perf_counter() if timing_enabled else None
         # actually, we should avoid assigning like this...
         micro_batch = micro_batch.to(get_device_id())
+        to_device_s = time.perf_counter() - to_device_start if timing_enabled else 0.0
+        prepare_inputs_start = time.perf_counter() if timing_enabled else None
         model_inputs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
+        prepare_model_inputs_s = time.perf_counter() - prepare_inputs_start if timing_enabled else 0.0
+        prepare_inputs_timing = dict(getattr(self, "_last_prepare_model_inputs_timing", {})) if timing_enabled else {}
 
         # Honor mixed_precision.param_dtype resolved during FSDP setup. When dtype is fp32,
         # autocast is a no-op at best and a footgun at worst, so skip it entirely.
@@ -1289,15 +1380,20 @@ class FSDPEngineWithLMHead(FSDPEngine):
             else torch.autocast(device_type=device_name, dtype=autocast_dtype)
         )
         with autocast_ctx:
+            model_forward_start = time.perf_counter() if timing_enabled else None
             raw_output = self.module(
                 **model_inputs,
                 use_cache=False,
             )  # prevent model thinks we are generating
+            model_forward_s = time.perf_counter() - model_forward_start if timing_enabled else 0.0
 
+            prepare_outputs_start = time.perf_counter() if timing_enabled else None
             model_output = self.prepare_model_outputs(
                 output=raw_output, output_args=output_args, micro_batch=micro_batch, logits_processor_func=loss_function
             )
+            prepare_model_outputs_s = time.perf_counter() - prepare_outputs_start if timing_enabled else 0.0
 
+            loss_start = time.perf_counter() if timing_enabled else None
             if loss_function is not None:
                 loss, metrics = loss_function(
                     model_output=model_output, data=micro_batch, dp_group=self.get_data_parallel_group()
@@ -1306,12 +1402,27 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 assert forward_only, "forward_only must be True when loss_function is None"
                 loss = torch.tensor(1.0, device=device_name)
                 metrics = {}
+            loss_s = time.perf_counter() - loss_start if timing_enabled else 0.0
+
+            loss_item_start = time.perf_counter() if timing_enabled else None
+            loss_item = loss.detach().item()
+            loss_item_s = time.perf_counter() - loss_item_start if timing_enabled else 0.0
 
             output = {
                 "model_output": model_output,
-                "loss": loss.detach().item(),
+                "loss": loss_item,
                 "metrics": metrics,
             }
+            if timing_enabled:
+                output["_engine_timing"] = {
+                    "to_device_s": to_device_s,
+                    "prepare_model_inputs_s": prepare_model_inputs_s,
+                    "resolve_multi_modal_refs_s": float(prepare_inputs_timing.get("resolve_multi_modal_refs_s", 0.0)),
+                    "model_forward_s": model_forward_s,
+                    "prepare_model_outputs_s": prepare_model_outputs_s,
+                    "loss_s": loss_s,
+                    "loss_item_s": loss_item_s,
+                }
 
             return loss, output
 

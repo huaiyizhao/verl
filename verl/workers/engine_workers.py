@@ -631,6 +631,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     @_with_routing_replay_flag(enabled=False)
     def compute_ref_log_prob(self, data: TensorDict) -> TensorDict:
+        tu.assign_non_tensor(data, verl_stage="ref_log_prob")
         output = self.ref.infer_batch(data=data)
         return output.cpu() if output is not None else None
 
@@ -638,6 +639,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob")
     @_with_routing_replay_flag(enabled=True)
     def compute_log_prob(self, data: TensorDict) -> TensorDict:
+        tu.assign_non_tensor(data, verl_stage="actor_log_prob")
         output = self.actor.infer_batch(data)
 
         return output.cpu() if output is not None else None
@@ -646,6 +648,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update")
     @_with_routing_replay_flag(enabled=True)
     def update_actor(self, data: TensorDict) -> TensorDict:
+        tu.assign_non_tensor(data, verl_stage="actor_update")
         output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None
 
