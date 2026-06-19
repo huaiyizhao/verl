@@ -357,7 +357,14 @@ class LLMServerManager:
             update_prometheus_config(self.rollout_config.prometheus, self.server_addresses, self.rollout_config.name)
 
     async def _init_global_load_balancer(self) -> None:
-        self.global_load_balancer = GlobalRequestLoadBalancer.remote(
+        # Pin the load balancer to the rollout node so agent-loop workers (also on
+        # that node) hit it with a node-local RPC each turn instead of crossing to
+        # the training node. No-op when VERL_ROLLOUT_NODE_RESOURCE is unset.
+        rollout_node_resource = os.getenv("VERL_ROLLOUT_NODE_RESOURCE") or None
+        balancer_cls = GlobalRequestLoadBalancer
+        if rollout_node_resource:
+            balancer_cls = GlobalRequestLoadBalancer.options(resources={rollout_node_resource: 0.001})
+        self.global_load_balancer = balancer_cls.remote(
             servers=dict(zip(self.server_addresses, self.server_handles, strict=True)),
             max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
         )
