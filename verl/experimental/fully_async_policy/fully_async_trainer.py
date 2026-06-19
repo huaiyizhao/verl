@@ -1278,5 +1278,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 }
             )
             for key, value in batch.meta_info.items():
-                if key.startswith("fully_async") or key.startswith("timing_s") or key.startswith("reward/"):
+                if (
+                    key.startswith("fully_async")
+                    or key.startswith("timing_s")
+                    or key.startswith("reward/")
+                    or key.startswith("image_refs")
+                ):
                     metrics[key] = value

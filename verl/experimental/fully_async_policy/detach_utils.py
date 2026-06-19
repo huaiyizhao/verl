@@ -298,9 +298,11 @@ def assemble_batch_from_rollout_samples(
     # postprocess_task_ms is the full per-sample postprocess wall time INCLUDING the
     # image-refs semaphore wait + to_thread attach (the thing the Semaphore size
     # controls); build_ms / bank_ref_put_ms break it down (HF image processing /
-    # ray.put of the bank). Keys are NOT prefixed with ``timing_s/`` so the
-    # MetricsAggregator aggregates them as mean/max rather than summing across the
-    # two updates in a param-sync window.
+    # ray.put of the bank). Keys use the ``image_refs/`` prefix (whitelisted in the
+    # trainer's _collect_metrics_from_samples alongside fully_async / timing_s /
+    # reward) so they are NOT force-summed like ``timing_s/`` keys -- the /mean and
+    # /max suffixes drive proper mean/max aggregation across the updates in a
+    # param-sync window.
     def _image_bank_ms(field: str) -> list[float]:
         out = []
         for rs in rollout_samples:

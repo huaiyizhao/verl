@@ -253,8 +253,11 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         # single slot (which made postprocess_tasks pile up and starve the trainer).
         # Keep this modest: each sample already fans out IMAGE_REF_PROCESS_WORKERS
         # threads internally, so N here multiplies that. Tune jointly; watch memory
-        # since each in-flight bank of processed tensors stays resident.
-        postprocess_concurrency = max(1, int(os.getenv("IMAGE_REF_POSTPROCESS_CONCURRENCY", "4")))
+        # since each in-flight bank of processed tensors stays resident -- all
+        # in-flight banks pile up on the single rollouter actor's node, so a high N
+        # multiplies that node's peak RSS. Default 2 trades a little drain
+        # concurrency for bounded memory.
+        postprocess_concurrency = max(1, int(os.getenv("IMAGE_REF_POSTPROCESS_CONCURRENCY", "2")))
         self.image_refs_postprocess_semaphore = asyncio.Semaphore(postprocess_concurrency)
 
     async def set_message_queue_client(self, message_queue_client: MessageQueueClient):
