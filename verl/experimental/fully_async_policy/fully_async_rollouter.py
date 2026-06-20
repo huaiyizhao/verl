@@ -36,6 +36,7 @@ from verl.experimental.fully_async_policy.image_refs import (
     attach_image_object_refs,
     attach_image_refs_to_dataproto,
     image_refs_enabled,
+    payload_as_numpy_object,
 )
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
@@ -863,11 +864,14 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
     def _put_image_objects_parallel(self, image_bank: dict[str, dict]) -> dict[str, ray.ObjectRef]:
         workers = min(IMAGE_REF_PUT_WORKERS, len(image_bank))
         if workers <= 1:
-            return {image_id: ray.put(payload) for image_id, payload in image_bank.items()}
+            return {image_id: ray.put(payload_as_numpy_object(payload)) for image_id, payload in image_bank.items()}
 
         image_object_refs = {}
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="image-ref-put") as executor:
-            futures = {executor.submit(ray.put, payload): image_id for image_id, payload in image_bank.items()}
+            futures = {
+                executor.submit(ray.put, payload_as_numpy_object(payload)): image_id
+                for image_id, payload in image_bank.items()
+            }
             for future in as_completed(futures):
                 image_object_refs[futures[future]] = future.result()
         return image_object_refs

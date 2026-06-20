@@ -173,6 +173,30 @@ def _payload_as_dict(payload: ProcessedImagePayload) -> dict[str, Any]:
     }
 
 
+def _tensor_to_numpy_for_ray(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach()
+        if tensor.device.type != "cpu":
+            tensor = tensor.cpu()
+        if not tensor.is_contiguous():
+            tensor = tensor.contiguous()
+        return tensor.numpy()
+    if isinstance(value, dict):
+        return {k: _tensor_to_numpy_for_ray(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_tensor_to_numpy_for_ray(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_tensor_to_numpy_for_ray(v) for v in value)
+    return value
+
+
+def payload_as_numpy_object(payload: dict[str, Any]) -> dict[str, Any]:
+    """Convert processed image tensors to ndarray payloads for Ray object refs."""
+    output = dict(payload)
+    output["inputs"] = _tensor_to_numpy_for_ray(payload.get("inputs", {}))
+    return output
+
+
 def _add_images_to_bank(
     multi_modal_data: dict[str, Any] | None,
     image_inputs: dict[str, tuple[Image.Image, int, str, tuple[int, int], str]],

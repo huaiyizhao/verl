@@ -28,6 +28,7 @@ from verl.experimental.fully_async_policy.image_refs import (
     attach_image_bank_ref,
     attach_image_object_refs,
     attach_image_refs_to_dataproto,
+    payload_as_numpy_object,
 )
 from verl.experimental.fully_async_policy.intermediate_trajectory_utils import _compute_position_ids
 from verl.utils import model as model_utils
@@ -202,9 +203,9 @@ def test_resolve_multi_modal_refs_uses_processed_bank_without_ray_get():
 def test_resolve_multi_modal_refs_uses_per_image_object_refs(monkeypatch):
     payload = {
         "inputs": {
-            "pixel_values": torch.ones(1, 3, 2, 2),
-            "image_grid_thw": torch.tensor([[1, 2, 2]], dtype=torch.long),
-            "images_seqlens": torch.tensor([4], dtype=torch.long),
+            "pixel_values": np.ones((1, 3, 2, 2), dtype=np.float32),
+            "image_grid_thw": np.array([[1, 2, 2]], dtype=np.int64),
+            "images_seqlens": np.array([4], dtype=np.int64),
         }
     }
     calls = []
@@ -240,6 +241,26 @@ def test_resolve_multi_modal_refs_uses_per_image_object_refs(monkeypatch):
     assert timing["resolve_mm_image_object_cache_misses"] == 1
     assert timing["resolve_mm_image_object_rows"] == 1
     assert timing.get("resolve_mm_bank_cache_misses", 0) == 0
+
+
+def test_payload_as_numpy_object_converts_processed_inputs_only():
+    payload = {
+        "image_id": "sha1:image",
+        "inputs": {
+            "pixel_values": torch.ones(1, 3, 2, 2),
+            "image_grid_thw": torch.tensor([[1, 2, 2]], dtype=torch.long),
+            "images_seqlens": torch.tensor([4], dtype=torch.long),
+        },
+        "processed_bytes": 64,
+    }
+
+    converted = payload_as_numpy_object(payload)
+
+    assert converted["image_id"] == "sha1:image"
+    assert isinstance(converted["inputs"]["pixel_values"], np.ndarray)
+    assert isinstance(converted["inputs"]["image_grid_thw"], np.ndarray)
+    assert isinstance(converted["inputs"]["images_seqlens"], np.ndarray)
+    assert isinstance(payload["inputs"]["pixel_values"], torch.Tensor)
 
 
 def test_resolve_multi_modal_refs_uses_placeholder_position_ids_without_image_grid():

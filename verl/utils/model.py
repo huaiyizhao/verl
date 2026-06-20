@@ -800,10 +800,22 @@ def _processed_payload_inputs(payload: Any) -> dict[str, Any]:
     if isinstance(payload, NonTensorData):
         payload = payload.data
     if isinstance(payload, dict) and "inputs" in payload:
-        return payload["inputs"]
+        return _numpy_inputs_to_torch(payload["inputs"])
     if isinstance(payload, dict):
-        return payload
+        return _numpy_inputs_to_torch(payload)
     raise TypeError(f"Unsupported processed image payload type: {type(payload)!r}")
+
+
+def _numpy_inputs_to_torch(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return torch.from_numpy(value)
+    if isinstance(value, dict):
+        return {k: _numpy_inputs_to_torch(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_numpy_inputs_to_torch(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_numpy_inputs_to_torch(v) for v in value)
+    return value
 
 
 def _merge_processed_image_inputs(inputs_list: list[dict[str, Any]]) -> dict[str, Any]:
