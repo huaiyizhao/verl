@@ -21,13 +21,16 @@ from verl import DataProto
 from verl.experimental.agent_loop.agent_loop import AgentLoopWorker
 from verl.experimental.fully_async_policy.image_refs import (
     IMAGE_BANK_REF_KEY,
+    IMAGE_OBJECT_REFS_KEY,
     MULTI_MODAL_DATA_KEY,
     MULTI_MODAL_INPUTS_KEY,
     MULTI_MODAL_REFS_KEY,
     attach_image_bank_ref,
+    attach_image_object_refs,
     attach_image_refs_to_dataproto,
 )
 from verl.experimental.fully_async_policy.intermediate_trajectory_utils import _compute_position_ids
+from verl.utils import model as model_utils
 from verl.utils.model import compute_vlm_position_ids, resolve_multi_modal_refs
 from verl.utils.tensordict_utils import nested_tensor_from_tensor_list
 
@@ -154,6 +157,16 @@ def test_attach_image_bank_ref_adds_text_only_empty_refs():
     assert output.non_tensor_batch[MULTI_MODAL_REFS_KEY][0] == {"image_ids": [], "video_ids": []}
 
 
+def test_attach_image_object_refs_adds_shared_object_mapping():
+    batch = TensorDict({"input_ids": torch.ones(1, 2, dtype=torch.long)}, batch_size=1)
+    data = DataProto(batch=batch, non_tensor_batch={})
+
+    output = attach_image_object_refs(data, {"sha1:image": "image-ref"})
+
+    assert output.non_tensor_batch[IMAGE_OBJECT_REFS_KEY].tolist() == [{"sha1:image": "image-ref"}]
+    assert output.non_tensor_batch[MULTI_MODAL_REFS_KEY][0] == {"image_ids": [], "video_ids": []}
+
+
 def test_resolve_multi_modal_refs_uses_processed_bank_without_ray_get():
     image_bank = {
         "sha1:image": {
@@ -184,6 +197,49 @@ def test_resolve_multi_modal_refs_uses_processed_bank_without_ray_get():
     assert micro_batch["position_ids"].dim() == 3
     assert micro_batch["position_ids"][0].shape == (3, 3)
     assert micro_batch["position_ids"].values().shape[0] == 3
+
+
+def test_resolve_multi_modal_refs_uses_per_image_object_refs(monkeypatch):
+    payload = {
+        "inputs": {
+            "pixel_values": torch.ones(1, 3, 2, 2),
+            "image_grid_thw": torch.tensor([[1, 2, 2]], dtype=torch.long),
+            "images_seqlens": torch.tensor([4], dtype=torch.long),
+        }
+    }
+    calls = []
+
+    def fake_get(refs):
+        calls.append(refs)
+        assert refs == ["image-object-ref"]
+        return [payload]
+
+    monkeypatch.setattr(model_utils.ray, "get", fake_get)
+    micro_batch = {
+        "input_ids": torch.tensor([[1, 42, 2]], dtype=torch.long),
+        "attention_mask": torch.tensor([[1, 1, 1]], dtype=torch.long),
+        "position_ids": torch.arange(3).unsqueeze(0),
+        MULTI_MODAL_REFS_KEY: _object_array([{"image_ids": ["sha1:image"], "video_ids": []}]),
+        IMAGE_BANK_REF_KEY: _object_array([None]),
+        IMAGE_OBJECT_REFS_KEY: _object_array([{"sha1:image": "image-object-ref"}]),
+    }
+    timing = {}
+
+    resolved = resolve_multi_modal_refs(
+        micro_batch,
+        tokenizer=None,
+        processor=DummyProcessor(),
+        bank_cache={},
+        image_object_cache={},
+        timing=timing,
+    )
+
+    assert len(calls) == 1
+    assert resolved["pixel_values"].shape == (1, 3, 2, 2)
+    assert resolved["image_grid_thw"].tolist() == [[1, 2, 2]]
+    assert timing["resolve_mm_image_object_cache_misses"] == 1
+    assert timing["resolve_mm_image_object_rows"] == 1
+    assert timing.get("resolve_mm_bank_cache_misses", 0) == 0
 
 
 def test_resolve_multi_modal_refs_uses_placeholder_position_ids_without_image_grid():

@@ -37,6 +37,7 @@ MULTI_MODAL_DATA_KEY = "multi_modal_data"
 MULTI_MODAL_INPUTS_KEY = "multi_modal_inputs"
 MULTI_MODAL_REFS_KEY = "multi_modal_refs"
 IMAGE_BANK_REF_KEY = "image_bank_ref"
+IMAGE_OBJECT_REFS_KEY = "image_object_refs"
 IMAGE_REF_PROCESS_WORKERS = max(1, int(os.getenv("IMAGE_REF_PROCESS_WORKERS", "8")))
 
 
@@ -318,6 +319,15 @@ def attach_image_bank_ref(data_proto: DataProto, image_bank_ref: Any | None) -> 
     nt = dict(data_proto.non_tensor_batch or {})
     n_rows = len(data_proto)
     nt[IMAGE_BANK_REF_KEY] = object_array([image_bank_ref] * n_rows)
+    if MULTI_MODAL_REFS_KEY not in nt:
+        nt[MULTI_MODAL_REFS_KEY] = object_array([empty_multi_modal_refs() for _ in range(n_rows)])
+    return DataProto(batch=data_proto.batch, non_tensor_batch=nt, meta_info=dict(data_proto.meta_info or {}))
+
+
+def attach_image_object_refs(data_proto: DataProto, image_object_refs: dict[str, Any] | None) -> DataProto:
+    nt = dict(data_proto.non_tensor_batch or {})
+    n_rows = len(data_proto)
+    nt[IMAGE_OBJECT_REFS_KEY] = object_array([image_object_refs] * n_rows)
     if MULTI_MODAL_REFS_KEY not in nt:
         nt[MULTI_MODAL_REFS_KEY] = object_array([empty_multi_modal_refs() for _ in range(n_rows)])
     return DataProto(batch=data_proto.batch, non_tensor_batch=nt, meta_info=dict(data_proto.meta_info or {}))

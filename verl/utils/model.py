@@ -947,6 +947,7 @@ def resolve_multi_modal_refs(
     processor,
     *,
     bank_cache: dict[Any, Any] | None = None,
+    image_object_cache: dict[str, Any] | None = None,
     timing: dict[str, float] | None = None,
 ) -> dict[str, torch.Tensor | list[torch.Tensor]]:
     """Resolve row-level image ids from a processed image bank.
@@ -963,6 +964,7 @@ def resolve_multi_modal_refs(
 
     setup_start = time.perf_counter() if timing is not None else None
     bank_refs = _unwrap_non_tensor_column(micro_batch.get("image_bank_ref", None))
+    image_object_refs = _unwrap_non_tensor_column(micro_batch.get("image_object_refs", None))
     input_ids = micro_batch["input_ids"]
     attention_mask = micro_batch.get("attention_mask", None)
     device = input_ids.device if isinstance(input_ids, torch.Tensor) else torch.device("cpu")
@@ -980,17 +982,50 @@ def resolve_multi_modal_refs(
         bank_refs.extend([None] * (len(refs_col) - len(bank_refs)))
     elif len(bank_refs) > len(refs_col):
         bank_refs = bank_refs[: len(refs_col)]
+    if len(image_object_refs) < len(refs_col):
+        image_object_refs.extend([None] * (len(refs_col) - len(image_object_refs)))
+    elif len(image_object_refs) > len(refs_col):
+        image_object_refs = image_object_refs[: len(refs_col)]
     if setup_start is not None:
         _timing_add(timing, "resolve_mm_setup_s", time.perf_counter() - setup_start)
         _timing_inc(timing, "resolve_mm_rows", len(input_rows))
 
     bank_cache = bank_cache if bank_cache is not None else {}
+    image_object_cache = image_object_cache if image_object_cache is not None else {}
     row_multi_modal_inputs: list[dict[str, torch.Tensor]] = []
     position_rows: list[torch.Tensor] = []
     unique_bank_keys: set[str] = set()
+    unique_image_object_ids: set[str] = set()
 
-    for row_idx, (refs, bank_ref, row_input_ids, row_attention) in enumerate(
-        zip(refs_col, bank_refs, input_rows, attention_rows, strict=True)
+    missing_image_objects: dict[str, Any] = {}
+    for refs, image_ref_map in zip(refs_col, image_object_refs, strict=True):
+        if isinstance(image_ref_map, NonTensorData):
+            image_ref_map = image_ref_map.data
+        if not isinstance(image_ref_map, dict):
+            continue
+        refs = refs or {"image_ids": [], "video_ids": []}
+        for image_id in refs.get("image_ids") or []:
+            unique_image_object_ids.add(image_id)
+            if image_id in image_object_cache:
+                if hasattr(image_object_cache, "move_to_end"):
+                    image_object_cache.move_to_end(image_id)
+                _timing_inc(timing, "resolve_mm_image_object_cache_hits")
+                continue
+            image_ref = image_ref_map.get(image_id)
+            if image_ref is not None:
+                missing_image_objects.setdefault(image_id, image_ref)
+    if missing_image_objects:
+        image_ids = list(missing_image_objects.keys())
+        ray_get_start = time.perf_counter() if timing is not None else None
+        payloads = ray.get([missing_image_objects[image_id] for image_id in image_ids])
+        if ray_get_start is not None:
+            _timing_add(timing, "resolve_mm_image_object_ray_get_s", time.perf_counter() - ray_get_start)
+            _timing_inc(timing, "resolve_mm_image_object_cache_misses", len(image_ids))
+        for image_id, payload in zip(image_ids, payloads, strict=True):
+            image_object_cache[image_id] = payload
+
+    for row_idx, (refs, bank_ref, image_ref_map, row_input_ids, row_attention) in enumerate(
+        zip(refs_col, bank_refs, image_object_refs, input_rows, attention_rows, strict=True)
     ):
         row_setup_start = time.perf_counter() if timing is not None else None
         refs = refs or {"image_ids": [], "video_ids": []}
@@ -1023,28 +1058,43 @@ def resolve_multi_modal_refs(
             _timing_inc(timing, "resolve_mm_image_refs", len(image_ids))
             if processor is None:
                 raise ValueError(f"multi_modal_refs row {row_idx} has images but processor is None")
-            if bank_ref is None:
-                raise ValueError(f"multi_modal_refs row {row_idx} has images but image_bank_ref is None")
-            bank_cache_key = str(bank_ref)
-            unique_bank_keys.add(bank_cache_key)
-            if bank_cache_key not in bank_cache:
-                ray_get_start = time.perf_counter() if timing is not None else None
-                image_bank = ray.get(bank_ref)
-                if ray_get_start is not None:
-                    _timing_add(timing, "resolve_mm_ray_get_s", time.perf_counter() - ray_get_start)
-                    _timing_inc(timing, "resolve_mm_bank_cache_misses")
-                bank_cache[bank_cache_key] = image_bank
-            else:
-                if hasattr(bank_cache, "move_to_end"):
-                    bank_cache.move_to_end(bank_cache_key)
-                image_bank = bank_cache[bank_cache_key]
-                _timing_inc(timing, "resolve_mm_bank_cache_hits")
             lookup_start = time.perf_counter() if timing is not None else None
             processed_inputs = []
-            for image_id in image_ids:
-                if image_id not in image_bank:
-                    raise KeyError(f"image_id {image_id[:20]} missing from processed image bank for row {row_idx}")
-                processed_inputs.append(_processed_payload_inputs(image_bank[image_id]))
+            if image_ids and all(image_id in image_object_cache for image_id in image_ids):
+                for image_id in image_ids:
+                    if hasattr(image_object_cache, "move_to_end"):
+                        image_object_cache.move_to_end(image_id)
+                    processed_inputs.append(_processed_payload_inputs(image_object_cache[image_id]))
+                _timing_inc(timing, "resolve_mm_image_object_rows")
+            else:
+                if bank_ref is None:
+                    if isinstance(image_ref_map, NonTensorData):
+                        image_ref_map = image_ref_map.data
+                    if isinstance(image_ref_map, dict):
+                        missing = [image_id for image_id in image_ids if image_id not in image_object_cache]
+                        raise KeyError(
+                            f"image_ids {[image_id[:20] for image_id in missing]} missing from image object refs "
+                            f"for row {row_idx}"
+                        )
+                    raise ValueError(f"multi_modal_refs row {row_idx} has images but image_bank_ref is None")
+                bank_cache_key = str(bank_ref)
+                unique_bank_keys.add(bank_cache_key)
+                if bank_cache_key not in bank_cache:
+                    ray_get_start = time.perf_counter() if timing is not None else None
+                    image_bank = ray.get(bank_ref)
+                    if ray_get_start is not None:
+                        _timing_add(timing, "resolve_mm_ray_get_s", time.perf_counter() - ray_get_start)
+                        _timing_inc(timing, "resolve_mm_bank_cache_misses")
+                    bank_cache[bank_cache_key] = image_bank
+                else:
+                    if hasattr(bank_cache, "move_to_end"):
+                        bank_cache.move_to_end(bank_cache_key)
+                    image_bank = bank_cache[bank_cache_key]
+                    _timing_inc(timing, "resolve_mm_bank_cache_hits")
+                for image_id in image_ids:
+                    if image_id not in image_bank:
+                        raise KeyError(f"image_id {image_id[:20]} missing from processed image bank for row {row_idx}")
+                    processed_inputs.append(_processed_payload_inputs(image_bank[image_id]))
             if lookup_start is not None:
                 _timing_add(timing, "resolve_mm_bank_lookup_s", time.perf_counter() - lookup_start)
             merge_start = time.perf_counter() if timing is not None else None
@@ -1069,6 +1119,7 @@ def resolve_multi_modal_refs(
         if stack_start is not None:
             _timing_add(timing, "resolve_mm_position_stack_s", time.perf_counter() - stack_start)
     _timing_inc(timing, "resolve_mm_unique_banks", len(unique_bank_keys))
+    _timing_inc(timing, "resolve_mm_unique_image_objects", len(unique_image_object_ids))
     extract_start = time.perf_counter() if timing is not None else None
     resolved = extract_multi_modal_inputs(row_multi_modal_inputs)
     if extract_start is not None:

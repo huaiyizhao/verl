@@ -17,7 +17,7 @@ import logging
 import multiprocessing
 import os
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pprint import pformat
 
 import numpy as np
@@ -33,6 +33,7 @@ from verl.experimental.fully_async_policy.detach_utils import (
 )
 from verl.experimental.fully_async_policy.image_refs import (
     attach_image_bank_ref,
+    attach_image_object_refs,
     attach_image_refs_to_dataproto,
     image_refs_enabled,
 )
@@ -49,6 +50,9 @@ from verl.workers.rollout.llm_server import LLMServerManager
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+IMAGE_REF_STORAGE_MODE = os.getenv("VERL_IMAGE_REF_STORAGE_MODE", "per_image").strip().lower()
+IMAGE_REF_PUT_WORKERS = max(1, int(os.getenv("VERL_IMAGE_REF_PUT_WORKERS", "8")))
 
 
 class FullyAsyncAgentLoopManager(AgentLoopManager):
@@ -826,14 +830,47 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             sample_id=rollout_sample.sample_id,
         )
         image_bank_stats["build_ms"] = (time.time() - image_ref_start) * 1000.0
-        bank_put_start = time.time()
-        image_bank_ref = ray.put(image_bank) if image_bank else None
-        image_bank_stats["bank_ref_put_ms"] = (time.time() - bank_put_start) * 1000.0
+        storage_mode = IMAGE_REF_STORAGE_MODE
+        if storage_mode not in {"per_image", "bank", "both"}:
+            raise ValueError(
+                f"VERL_IMAGE_REF_STORAGE_MODE must be one of per_image, bank, both; got {IMAGE_REF_STORAGE_MODE!r}"
+            )
+
+        image_object_refs = None
+        if image_bank and storage_mode in {"per_image", "both"}:
+            object_put_start = time.time()
+            image_object_refs = self._put_image_objects_parallel(image_bank)
+            image_bank_stats["image_object_put_ms"] = (time.time() - object_put_start) * 1000.0
+            image_bank_stats["image_objects"] = len(image_object_refs)
+        else:
+            image_bank_stats["image_object_put_ms"] = 0.0
+            image_bank_stats["image_objects"] = 0
+
+        image_bank_ref = None
+        if image_bank and storage_mode in {"bank", "both"}:
+            bank_put_start = time.time()
+            image_bank_ref = ray.put(image_bank)
+            image_bank_stats["bank_ref_put_ms"] = (time.time() - bank_put_start) * 1000.0
+        else:
+            image_bank_stats["bank_ref_put_ms"] = 0.0
         rollout_sample.full_batch = attach_image_bank_ref(rollout_sample.full_batch, image_bank_ref)
+        rollout_sample.full_batch = attach_image_object_refs(rollout_sample.full_batch, image_object_refs)
         image_bank_stats["total_ms"] = (time.time() - image_ref_start) * 1000.0
         rollout_sample.image_bank_ref = image_bank_ref
         rollout_sample.image_bank_stats = image_bank_stats
         return rollout_sample
+
+    def _put_image_objects_parallel(self, image_bank: dict[str, dict]) -> dict[str, ray.ObjectRef]:
+        workers = min(IMAGE_REF_PUT_WORKERS, len(image_bank))
+        if workers <= 1:
+            return {image_id: ray.put(payload) for image_id, payload in image_bank.items()}
+
+        image_object_refs = {}
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="image-ref-put") as executor:
+            futures = {executor.submit(ray.put, payload): image_id for image_id, payload in image_bank.items()}
+            for future in as_completed(futures):
+                image_object_refs[futures[future]] = future.result()
+        return image_object_refs
 
     async def _postprocess_and_publish_sample(self, rollout_sample: RolloutSample):
         try:

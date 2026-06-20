@@ -740,6 +740,9 @@ class FSDPEngine(BaseEngine):
         bank_cache = getattr(self, "_image_ref_bank_cache", None)
         if bank_cache is not None:
             bank_cache.clear()
+        image_object_cache = getattr(self, "_image_ref_object_cache", None)
+        if image_object_cache is not None:
+            image_object_cache.clear()
         if timing_enabled:
             total_s = time.perf_counter() - call_start
             to_device_s = sum(float(t.get("to_device_s", 0.0)) for t in micro_timing_lst)
@@ -749,6 +752,7 @@ class FSDPEngine(BaseEngine):
                 "resolve_mm_setup_s",
                 "resolve_mm_row_setup_s",
                 "resolve_mm_ray_get_s",
+                "resolve_mm_image_object_ray_get_s",
                 "resolve_mm_bank_lookup_s",
                 "resolve_mm_merge_s",
                 "resolve_mm_rope_s",
@@ -759,8 +763,12 @@ class FSDPEngine(BaseEngine):
                 "resolve_mm_image_rows",
                 "resolve_mm_image_refs",
                 "resolve_mm_unique_banks",
+                "resolve_mm_unique_image_objects",
                 "resolve_mm_bank_cache_hits",
                 "resolve_mm_bank_cache_misses",
+                "resolve_mm_image_object_cache_hits",
+                "resolve_mm_image_object_cache_misses",
+                "resolve_mm_image_object_rows",
             ]
             resolve_mm_details = {
                 key: sum(float(t.get(key, 0.0)) for t in micro_timing_lst) for key in resolve_mm_detail_keys
@@ -786,6 +794,7 @@ class FSDPEngine(BaseEngine):
                 f"resolve_mm_setup_s={resolve_mm_details['resolve_mm_setup_s']:.3f} "
                 f"resolve_mm_row_setup_s={resolve_mm_details['resolve_mm_row_setup_s']:.3f} "
                 f"resolve_mm_ray_get_s={resolve_mm_details['resolve_mm_ray_get_s']:.3f} "
+                f"resolve_mm_image_object_ray_get_s={resolve_mm_details['resolve_mm_image_object_ray_get_s']:.3f} "
                 f"resolve_mm_bank_lookup_s={resolve_mm_details['resolve_mm_bank_lookup_s']:.3f} "
                 f"resolve_mm_merge_s={resolve_mm_details['resolve_mm_merge_s']:.3f} "
                 f"resolve_mm_rope_s={resolve_mm_details['resolve_mm_rope_s']:.3f} "
@@ -796,8 +805,13 @@ class FSDPEngine(BaseEngine):
                 f"resolve_mm_image_rows={resolve_mm_details['resolve_mm_image_rows']:.0f} "
                 f"resolve_mm_image_refs={resolve_mm_details['resolve_mm_image_refs']:.0f} "
                 f"resolve_mm_unique_banks={resolve_mm_details['resolve_mm_unique_banks']:.0f} "
+                f"resolve_mm_unique_image_objects={resolve_mm_details['resolve_mm_unique_image_objects']:.0f} "
                 f"resolve_mm_bank_cache_hits={resolve_mm_details['resolve_mm_bank_cache_hits']:.0f} "
                 f"resolve_mm_bank_cache_misses={resolve_mm_details['resolve_mm_bank_cache_misses']:.0f} "
+                f"resolve_mm_image_object_cache_hits={resolve_mm_details['resolve_mm_image_object_cache_hits']:.0f} "
+                "resolve_mm_image_object_cache_misses="
+                f"{resolve_mm_details['resolve_mm_image_object_cache_misses']:.0f} "
+                f"resolve_mm_image_object_rows={resolve_mm_details['resolve_mm_image_object_rows']:.0f} "
                 f"model_forward_s={model_forward_s:.3f} prepare_outputs_s={prepare_outputs_s:.3f} "
                 f"loss_s={loss_s:.3f} loss_item_s={loss_item_s:.3f} "
                 f"micro_forward_max_s={micro_forward_max_s:.3f} "
@@ -1083,6 +1097,9 @@ class FSDPEngineWithLMHead(FSDPEngine):
         bank_cache = getattr(self, "_image_ref_bank_cache", None)
         if bank_cache is None:
             bank_cache = self._image_ref_bank_cache = OrderedDict()
+        image_object_cache = getattr(self, "_image_ref_object_cache", None)
+        if image_object_cache is None:
+            image_object_cache = self._image_ref_object_cache = OrderedDict()
         timing_enabled = self._timing_log_enabled() and self._timing_log_rank_enabled()
         resolve_start = time.perf_counter() if timing_enabled else None
         resolve_timing: dict[str, float] | None = {} if timing_enabled else None
@@ -1091,6 +1108,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
             self.model_config.tokenizer,
             self.model_config.processor,
             bank_cache=bank_cache,
+            image_object_cache=image_object_cache,
             timing=resolve_timing,
         )
         if timing_enabled:
@@ -1102,6 +1120,9 @@ class FSDPEngineWithLMHead(FSDPEngine):
         max_bank_cache_size = int(os.getenv("VERL_IMAGE_REF_BANK_CACHE_SIZE", "8"))
         while max_bank_cache_size >= 0 and len(bank_cache) > max_bank_cache_size:
             bank_cache.popitem(last=False)
+        max_image_object_cache_size = int(os.getenv("VERL_IMAGE_REF_OBJECT_CACHE_SIZE", "512"))
+        while max_image_object_cache_size >= 0 and len(image_object_cache) > max_image_object_cache_size:
+            image_object_cache.popitem(last=False)
         input_ids = micro_batch["input_ids"]
         position_ids = micro_batch["position_ids"]
 
