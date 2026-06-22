@@ -362,6 +362,8 @@ class AgentLoopWorker:
         llm_client: LLMServerClient,
         teacher_client: dict[str, LLMServerClient] = None,
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
+        tokenizer=None,
+        processor=None,
     ):
         self.config = config
         self.llm_client = llm_client
@@ -373,9 +375,18 @@ class AgentLoopWorker:
         self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config)
 
         self.dataset_cls = get_dataset_class(config.data)
-        self.tokenizer = self.model_config.tokenizer
-        self.processor = self.model_config.processor
+        self.tokenizer = tokenizer if tokenizer is not None else self.model_config.tokenizer
+        self.processor = processor if processor is not None else self.model_config.processor
+        self.model_config.tokenizer = self.tokenizer
+        self.model_config.processor = self.processor
         self.image_refs_enabled = image_refs_enabled(config)
+        if self.tokenizer is None:
+            raise ValueError("AgentLoopWorker tokenizer is None; tokenizer must be loaded before rollout.")
+        if self.image_refs_enabled and self.processor is None:
+            raise ValueError(
+                "AgentLoopWorker processor is None while image refs are enabled; "
+                "VLM rollout requires a valid multimodal processor."
+            )
 
         # Online policy distillation
         self.distillation_enabled = is_distillation_enabled(config.distillation)
@@ -1168,6 +1179,8 @@ class AgentLoopManager:
         llm_client: LLMServerClient,
         teacher_client: dict[str, LLMServerClient] = None,
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
+        tokenizer=None,
+        processor=None,
     ):
         self.config = config
         self.rollout_config = config.actor_rollout_ref.rollout
@@ -1175,6 +1188,8 @@ class AgentLoopManager:
         self.llm_client = llm_client
         self.teacher_client = teacher_client
         self.reward_loop_worker_handles = reward_loop_worker_handles
+        self.tokenizer = tokenizer
+        self.processor = processor
 
         if not hasattr(self, "agent_loop_workers_class"):
             self.agent_loop_workers_class = ray.remote(AgentLoopWorker)
@@ -1214,6 +1229,8 @@ class AgentLoopManager:
                     self.llm_client,
                     self.teacher_client,
                     self.reward_loop_worker_handles,
+                    self.tokenizer,
+                    self.processor,
                 )
             )
 

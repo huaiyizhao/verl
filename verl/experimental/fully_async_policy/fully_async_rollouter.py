@@ -563,6 +563,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             llm_client=self.llm_server_manager.get_client(fully_async=True),
             reward_loop_worker_handles=reward_loop_worker_handles,
             teacher_client=self.teacher_model_manager.get_client() if self.teacher_model_manager else None,
+            tokenizer=self.tokenizer,
+            processor=self.processor,
         )
 
     # Add samples to the pending_queue
