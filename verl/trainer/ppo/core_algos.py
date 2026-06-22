@@ -2456,6 +2456,18 @@ def compute_policy_loss_bypass_mode(
     # In bypass mode: old_log_prob IS rollout_log_prob
     rollout_log_prob = old_log_prob
 
+    if not response_mask.any():
+        # Padding-only micro-batches can appear after fully-async padding and
+        # dynamic micro-batch balancing. They should participate in the
+        # distributed backward schedule but contribute no training signal.
+        zero_loss = log_prob.sum() * 0.0
+        return zero_loss, {
+            "actor/pg_clipfrac": 0.0,
+            "actor/ppo_kl": 0.0,
+            "actor/pg_clipfrac_lower": 0.0,
+            "rollout_corr/all_zero_response_mask_micro_batch": 1.0,
+        }
+
     # Compute IS weights and rejection mask
     # Note: For PPO-clip, we still compute IS weights for metrics, but don't apply them
     with torch.no_grad():
@@ -2510,5 +2522,6 @@ def compute_policy_loss_bypass_mode(
 
     # Merge rollout correction metrics
     pg_metrics.update(rollout_metrics)
+    pg_metrics["rollout_corr/all_zero_response_mask_micro_batch"] = 0.0
 
     return pg_loss, pg_metrics
