@@ -39,7 +39,7 @@ import hydra
 import numpy as np
 import ray
 import torch
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 from PIL import Image
 from pydantic import BaseModel, ConfigDict
 from tensordict import TensorDict
@@ -372,7 +372,18 @@ class AgentLoopWorker:
 
         rollout_config, model_config = config.actor_rollout_ref.rollout, config.actor_rollout_ref.model
         self.rollout_config: RolloutConfig = omega_conf_to_dataclass(rollout_config)
-        self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config)
+        model_config_for_worker = model_config
+        if tokenizer is not None and processor is not None:
+            if isinstance(model_config, DictConfig):
+                model_config_for_worker = OmegaConf.create(model_config)
+                with open_dict(model_config_for_worker):
+                    # HFModelConfig.load_tokenizer gates both hf_tokenizer() and hf_processor().
+                    model_config_for_worker.load_tokenizer = False
+            elif isinstance(model_config, dict):
+                model_config_for_worker = dict(model_config)
+                # HFModelConfig.load_tokenizer gates both hf_tokenizer() and hf_processor().
+                model_config_for_worker["load_tokenizer"] = False
+        self.model_config: HFModelConfig = omega_conf_to_dataclass(model_config_for_worker)
 
         self.dataset_cls = get_dataset_class(config.data)
         self.tokenizer = tokenizer if tokenizer is not None else self.model_config.tokenizer
