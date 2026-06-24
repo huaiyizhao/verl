@@ -97,12 +97,11 @@ def _img_keys_in(part: str) -> set[str]:
 @pytest.fixture(scope="module")
 def ray_tq():
     if not ray.is_initialized():
-        # Attach to an existing cluster if present (no num_cpus/num_gpus then),
-        # otherwise start a small local one.
-        try:
-            ray.init(address="auto", ignore_reinit_error=True)
-        except (ConnectionError, ValueError):
-            ray.init(num_cpus=4, ignore_reinit_error=True)
+        # Force a hermetic, single-node local Ray (``address="local"``) so the
+        # TransferQueue storage-unit actors are scheduled on THIS node where
+        # ``transfer_queue`` is importable. Attaching to a shared multi-node
+        # cluster fails unless the package is installed on every node.
+        ray.init(address="local", num_cpus=8, ignore_reinit_error=True, log_to_driver=False)
     cfg = OmegaConf.create(
         {
             "async_training": {
