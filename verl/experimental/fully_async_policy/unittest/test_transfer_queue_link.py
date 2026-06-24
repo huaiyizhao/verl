@@ -179,8 +179,8 @@ def test_data_link_foundation(ray_tq):
         got_a = await tq.async_kv_batch_get(keys=["A"], partition_id=PARTITION_IMAGES)
         torch.testing.assert_close(_densify(got_a["pixel_values"]).squeeze(0), pa["pixel_values"])
 
-        # consumed rows are cleared from the stream
-        assert _img_keys_in("rollout_stream") == set()
+        # episode 1's rows are cleared on consume; episode 2's remain queued.
+        assert _img_keys_in("rollout_stream") == {"promptX:1:0", "promptX:1:1"}
 
         # ---- refcount GC --------------------------------------------
         # release ep1's images: B -> 0 (cleared), A still referenced by ep2.
