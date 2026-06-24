@@ -24,7 +24,7 @@ from omegaconf import OmegaConf
 
 from verl.experimental.fully_async_policy.fully_async_rollouter import FullyAsyncRollouter
 from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
-from verl.experimental.fully_async_policy.message_queue import MessageQueue, MessageQueueClient
+from verl.experimental.fully_async_policy.message_queue import MessageQueue, MessageQueueClient, init_transfer_queue
 from verl.experimental.reward_loop import migrate_legacy_reward_impl
 from verl.experimental.separation.utils import create_resource_pool_manager, create_role_worker_mapping
 from verl.trainer.ppo.utils import Role
@@ -90,9 +90,14 @@ class FullyAsyncTaskRunner:
         print(f"total_train_steps {total_train_steps}")
         ray.get(self.components["trainer"].set_total_train_steps.remote(total_train_steps))
 
+        # TransferQueue data plane: bring up the controller + configured storage
+        # backend on the driver before any producer/consumer attaches.
+        print("[ASYNC MAIN] Initializing TransferQueue data plane...")
+        init_transfer_queue(config)
+
         # max_queue_size
         max_queue_size = ray.get(self.components["rollouter"].get_max_queue_size.remote())
-        print(f"[ASYNC MAIN] Creating MessageQueue... max_queue_size {max_queue_size}")
+        print(f"[ASYNC MAIN] Creating MessageQueue coordinator... max_queue_size {max_queue_size}")
         message_queue = MessageQueue.remote(config, max_queue_size)
         message_queue_client = MessageQueueClient(message_queue)
         self.components["message_queue"] = message_queue

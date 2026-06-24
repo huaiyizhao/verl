@@ -25,6 +25,18 @@ async_training:
   # whether to use trainer do_validate
   use_trainer_do_validate: False
 
+  # TransferQueue data-link backend. Forwarded verbatim to ``tq.init`` as the
+  # ``backend`` section by ``message_queue.init_transfer_queue`` (pure
+  # passthrough), so any TransferQueue backend + its subkeys work without code
+  # changes. Default SimpleStorage needs no extra dependencies; switch to
+  # ``RayStore`` for zero-copy Ray Direct Transport, or ``MooncakeStore`` on an
+  # RDMA cluster.
+  transfer_queue:
+    storage_backend: SimpleStorage
+    SimpleStorage:
+      # Recommended: >= 2 x number of nodes for load balancing.
+      num_data_storage_units: 2
+
 # Rollout config
 rollout:
 
