@@ -174,8 +174,10 @@ def test_data_link_foundation(ray_tq):
         # image tensors are real tensors in TQ (zero-copy path), byte-equal
         import transfer_queue as tq
 
+        from verl.experimental.fully_async_policy.message_queue import _densify
+
         got_a = await tq.async_kv_batch_get(keys=["A"], partition_id=PARTITION_IMAGES)
-        torch.testing.assert_close(got_a["pixel_values"].squeeze(0), pa["pixel_values"])
+        torch.testing.assert_close(_densify(got_a["pixel_values"]).squeeze(0), pa["pixel_values"])
 
         # consumed rows are cleared from the stream
         assert _img_keys_in("rollout_stream") == set()

@@ -295,6 +295,22 @@ def _unwrap_non_tensor(value: Any) -> Any:
     return value.data if isinstance(value, NonTensorData) else value
 
 
+def _densify(t: Any) -> Any:
+    """Convert a TransferQueue nested/jagged tensor back to a dense tensor.
+
+    SimpleStorage reconstructs multi-key ``kv_batch_get`` results as nested
+    tensors (each sample is stored independently). Our trajectory rows are
+    uniform-length by construction (padded to ``prompt_length`` /
+    ``response_length`` during expansion), so stacking the rows yields the exact
+    original dense tensor with no padding assumption.
+    """
+    import torch
+
+    if isinstance(t, torch.Tensor) and t.is_nested:
+        return torch.stack(list(t.unbind()))
+    return t
+
+
 def _from_get_tensordict(td: Any, meta_info: dict[str, Any]) -> Any:
     """Inverse of :func:`_to_put_tensordict`: rebuild a DataProto."""
     import torch
@@ -308,7 +324,7 @@ def _from_get_tensordict(td: Any, meta_info: dict[str, Any]) -> Any:
     for k in td.keys():
         v = td.get(k)
         if isinstance(v, torch.Tensor):
-            tensor_cols[k] = v
+            tensor_cols[k] = _densify(v)
             continue
         # NonTensorStack / object column -> unwrap to raw python values.
         raw = [_unwrap_non_tensor(v[i]) for i in range(n)]
