@@ -78,6 +78,16 @@ class Qwen3VLProcessor(DummyProcessor):
     pass
 
 
+class RecordingVisionTypeProcessor(DummyProcessor):
+    def __init__(self):
+        super().__init__()
+        self.last_mm_token_type_ids = None
+
+    def get_rope_index(self, input_ids, attention_mask, **kwargs):
+        self.last_mm_token_type_ids = kwargs.get("mm_token_type_ids").clone()
+        return super().get_rope_index(input_ids, attention_mask, **kwargs)
+
+
 def _object_array(values):
     arr = np.empty(len(values), dtype=object)
     for idx, value in enumerate(values):
@@ -379,6 +389,21 @@ def test_compute_vlm_position_ids_adds_text_axis_for_qwen3vl():
 
     assert position_ids.shape == (1, 4, 3)
     assert position_ids[:, 0].tolist() == [[0, 1, 2]]
+
+
+def test_compute_vlm_position_ids_marks_only_grid_backed_vision_tokens():
+    processor = RecordingVisionTypeProcessor()
+    input_ids = torch.tensor([[7, 42, 42, 42, 42, 8, 43, 43, 9, 42, 43]], dtype=torch.long)
+    attention_mask = torch.ones_like(input_ids)
+    multi_modal_inputs = {
+        "image_grid_thw": torch.tensor([[1, 2, 2]], dtype=torch.long),
+        "video_grid_thw": torch.tensor([[1, 1, 2]], dtype=torch.long),
+    }
+
+    compute_vlm_position_ids(processor, input_ids, attention_mask, multi_modal_inputs)
+
+    expected = torch.tensor([[0, 1, 1, 1, 1, 0, 2, 2, 0, 0, 0]], dtype=torch.long)
+    assert processor.last_mm_token_type_ids.tolist() == expected.tolist()
 
 
 def test_agent_loop_position_ids_skip_rope_without_image_grid():

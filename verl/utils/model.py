@@ -927,6 +927,29 @@ def compute_vlm_position_ids(
             processor, _compute_text_position_ids_3d(input_ids, attention_mask), input_ids, attention_mask
         )
 
+    def _grid_token_budget(grid_thw: torch.Tensor | None) -> int:
+        if grid_thw is None:
+            return 0
+        spatial_merge_size = getattr(getattr(processor, "image_processor", None), "merge_size", 1) or 1
+        grid = grid_thw.detach().cpu().long()
+        return int((grid[:, 0] * (grid[:, 1] // spatial_merge_size) * (grid[:, 2] // spatial_merge_size)).sum().item())
+
+    def _mark_real_vision_tokens(
+        token_type_ids: torch.Tensor, token_id: int | None, token_type: int, budget: int
+    ) -> None:
+        if token_id is None or budget <= 0:
+            return
+        remaining = budget
+        for row_idx in range(input_ids.shape[0]):
+            if remaining <= 0:
+                break
+            positions = (input_ids[row_idx] == token_id).nonzero(as_tuple=False).flatten()
+            if positions.numel() == 0:
+                continue
+            positions = positions[:remaining]
+            token_type_ids[row_idx, positions] = token_type
+            remaining -= int(positions.numel())
+
     mm_kwargs: dict[str, Any] = {
         "image_grid_thw": image_grid_thw,
         "video_grid_thw": video_grid_thw,
@@ -939,10 +962,11 @@ def compute_vlm_position_ids(
     needs_token_type_ids = needs_token_type_ids or image_token_id is not None or video_token_id is not None
     if needs_token_type_ids:
         mm_token_type_ids = torch.zeros_like(input_ids)
-        if image_token_id is not None:
-            mm_token_type_ids[0][input_ids[0] == image_token_id] = 1
-        if video_token_id is not None:
-            mm_token_type_ids[0][input_ids[0] == video_token_id] = 2
+        # Only mark real prompt-side vision placeholders that have matching
+        # grids. Responses may occasionally sample vision special tokens; those
+        # should remain text tokens instead of consuming missing grid entries.
+        _mark_real_vision_tokens(mm_token_type_ids, image_token_id, 1, _grid_token_budget(image_grid_thw))
+        _mark_real_vision_tokens(mm_token_type_ids, video_token_id, 2, _grid_token_budget(video_grid_thw))
         mm_kwargs["mm_token_type_ids"] = mm_token_type_ids
 
     position_ids, _ = processor.get_rope_index(
