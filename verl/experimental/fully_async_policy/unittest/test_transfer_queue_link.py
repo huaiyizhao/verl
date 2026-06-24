@@ -97,7 +97,12 @@ def _img_keys_in(part: str) -> set[str]:
 @pytest.fixture(scope="module")
 def ray_tq():
     if not ray.is_initialized():
-        ray.init(num_cpus=4, ignore_reinit_error=True)
+        # Attach to an existing cluster if present (no num_cpus/num_gpus then),
+        # otherwise start a small local one.
+        try:
+            ray.init(address="auto", ignore_reinit_error=True)
+        except (ConnectionError, ValueError):
+            ray.init(num_cpus=4, ignore_reinit_error=True)
     cfg = OmegaConf.create(
         {
             "async_training": {
@@ -109,6 +114,17 @@ def ray_tq():
         }
     )
     init_transfer_queue(cfg)
+    # Defensive: clear any leftover keys from a prior crashed run in this
+    # (persistent, shared) cluster so exact key-set assertions are reliable.
+    import transfer_queue as tq
+
+    for part in ("rollout_stream", "rollout_val", PARTITION_IMAGES):
+        try:
+            stale = list(tq.kv_list(partition_id=part).get(part, {}).keys())
+            if stale:
+                tq.kv_clear(keys=stale, partition_id=part)
+        except Exception:
+            pass
     yield cfg
     try:
         import transfer_queue as tq
