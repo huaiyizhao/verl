@@ -1373,6 +1373,8 @@ class PPOTrainer(ABC):
 
         # 4. write nested advantages and returns back to TransferQueue
         fields = ["advantages", "returns"]
+        if "rollout_loss_weights" in data.batch:
+            fields.append("rollout_loss_weights")
         if self.config.algorithm.use_kl_in_reward:
             fields.append("token_level_rewards")
         if rollout_correction:

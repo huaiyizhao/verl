@@ -84,3 +84,25 @@ def test_compute_advantage_for_multi_trajectories(batch_data: DataProto):
     )
     assert torch.equal(result.batch["advantages"], adv_expected)
     assert torch.equal(result.batch["returns"], adv_expected)
+
+
+def test_compute_advantage_for_multi_trajectories_adds_rollout_loss_weights(batch_data: DataProto):
+    result = compute_advantage_for_multi_trajectories(
+        data=batch_data,
+        batch_keys=["prompt_a_0_0", "prompt_a_0_1", "prompt_a_2_0", "prompt_a_2_1", "prompt_a_3_0", "prompt_a_4_0"],
+        adv_estimator=AdvantageEstimator.GRPO,
+    )
+
+    expected_weights = torch.tensor(
+        [
+            [1 / (4 * 5**0.5), 0.0, 0.0, 0.0],
+            [1 / (4 * 5**0.5), 1 / (4 * 5**0.5), 1 / (4 * 5**0.5), 1 / (4 * 5**0.5)],
+            [1 / (4 * 4**0.5), 0.0, 1 / (4 * 4**0.5), 0.0],
+            [0.0, 1 / (4 * 4**0.5), 0.0, 1 / (4 * 4**0.5)],
+            [1 / (4 * 3**0.5), 1 / (4 * 3**0.5), 0.0, 1 / (4 * 3**0.5)],
+            [0.0, 0.0, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    assert torch.allclose(result.batch["rollout_loss_weights"], expected_weights)

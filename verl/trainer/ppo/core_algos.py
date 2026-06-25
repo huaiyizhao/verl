@@ -113,6 +113,18 @@ class AdvantageEstimator(str, Enum):
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
 
 
+def _get_grpo_adv_std_floor(config: Optional[AlgoConfig]) -> float:
+    if config is None:
+        return 0.0
+    return max(float(config.get("grpo_adv_std_floor", 0.0) or 0.0), 0.0)
+
+
+def _apply_std_floor(std: torch.Tensor, std_floor: float) -> torch.Tensor:
+    if std_floor <= 0.0:
+        return std
+    return torch.clamp(std, min=std_floor)
+
+
 def register_adv_est(name_or_enum: str | AdvantageEstimator) -> Any:
     """Decorator to register a advantage estimator function with a given name.
 
@@ -306,6 +318,7 @@ def compute_grpo_outcome_advantage(
     id2score = defaultdict(list)
     id2mean = {}
     id2std = {}
+    grpo_adv_std_floor = _get_grpo_adv_std_floor(config)
 
     with torch.no_grad():
         bsz = scores.shape[0]
@@ -313,8 +326,8 @@ def compute_grpo_outcome_advantage(
             id2score[index[i]].append(scores[i])
         for idx in id2score:
             if len(id2score[idx]) == 1:
-                id2mean[idx] = torch.tensor(0.0)
-                id2std[idx] = torch.tensor(1.0)
+                id2mean[idx] = scores.new_tensor(0.0)
+                id2std[idx] = scores.new_tensor(1.0)
             elif len(id2score[idx]) > 1:
                 scores_tensor = torch.stack(id2score[idx])
                 id2mean[idx] = torch.mean(scores_tensor)
@@ -323,7 +336,8 @@ def compute_grpo_outcome_advantage(
                 raise ValueError(f"no score in prompt index: {idx}")
         for i in range(bsz):
             if norm_adv_by_std_in_grpo:
-                scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+                std = _apply_std_floor(id2std[index[i]], grpo_adv_std_floor)
+                scores[i] = (scores[i] - id2mean[index[i]]) / (std + epsilon)
             else:
                 scores[i] = scores[i] - id2mean[index[i]]
         scores = scores.unsqueeze(-1) * response_mask
@@ -351,7 +365,8 @@ def compute_grpo_vectorized_outcome_advantage(
         g = as_torch_index(index, device=scores.device)
         mean_g, std_g, _ = group_mean_std(scores, g, eps=0.0, device=scores.device)
         if norm_adv_by_std_in_grpo:
-            scalars = (scores - mean_g[g]) / (std_g[g] + epsilon)
+            std = _apply_std_floor(std_g[g], _get_grpo_adv_std_floor(config))
+            scalars = (scores - mean_g[g]) / (std + epsilon)
         else:
             scalars = scores - mean_g[g]
         advantages = scalars.unsqueeze(-1) * response_mask
@@ -498,6 +513,7 @@ def compute_grpo_passk_outcome_advantage(
     assert config is not None
     # if True, normalize advantage by std within group
     norm_adv_by_std_in_grpo = config.get("norm_adv_by_std_in_grpo", True)
+    grpo_adv_std_floor = _get_grpo_adv_std_floor(config)
     scores = token_level_rewards.sum(dim=-1)  # (bs,)
     advantages = torch.zeros_like(scores)
 
@@ -522,7 +538,7 @@ def compute_grpo_passk_outcome_advantage(
             i_max = id2indices[idx][topk_idx[0].item()]
             advantage = r_max - r_second_max
             if norm_adv_by_std_in_grpo:
-                std = torch.std(rewards)
+                std = _apply_std_floor(torch.std(rewards), grpo_adv_std_floor)
                 advantage = advantage / (std + epsilon)
             advantages[i_max] = advantage
 
@@ -1143,6 +1159,7 @@ def agg_loss(
     batch_num_tokens: Optional[int] = None,
     global_batch_size: Optional[int] = None,
     loss_scale_factor: Optional[int] = None,
+    rollout_loss_weights: Optional[torch.Tensor] = None,
 ):
     """
     Aggregate the loss across global batch to ensure the loss is invariant to fsdp/megatron parallelism.
@@ -1160,6 +1177,7 @@ def agg_loss(
         global_batch_size: global batch size
         loss_scale_factor: scale factor for "seq-mean-token-sum-norm" mode. If None, uses loss_mask.shape[-1].
             Set this to a constant value to ensure consistent normalization throughout training.
+        rollout_loss_weights: optional final per-token multipliers for rollout-level loss aggregation.
 
     Returns:
         loss: `a scalar torch.Tensor`
@@ -1193,6 +1211,17 @@ def agg_loss(
                 raise ValueError("global_batch_size is required when dp_size > 1")
             global_batch_size = seq_mask.sum()
         loss = verl_F.masked_sum(seq_losses, seq_mask) / global_batch_size * dp_size  # seq-mean
+    elif loss_agg_mode == "rollout-mean-token-sum-sqrt-norm":
+        if rollout_loss_weights is None:
+            row_token_counts = loss_mask.to(torch.float32).sum(dim=-1, keepdim=True).clamp(min=1.0)
+            if global_batch_size is not None:
+                rollout_count = global_batch_size
+            else:
+                row_has_tokens = torch.sum(loss_mask, dim=-1) > 0
+                rollout_count = row_has_tokens.sum().clamp(min=1)
+            rollout_loss_weights = loss_mask.to(torch.float32) / torch.sqrt(row_token_counts) / rollout_count
+        token_weights = rollout_loss_weights.to(loss_mat.device, dtype=loss_mat.dtype)
+        loss = torch.sum(loss_mat * loss_mask.to(loss_mat.dtype) * token_weights) * dp_size
     else:
         raise ValueError(f"Invalid loss_agg_mode: {loss_agg_mode}")
 
