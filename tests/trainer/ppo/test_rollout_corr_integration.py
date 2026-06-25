@@ -17,12 +17,12 @@ import pytest
 import torch
 
 from verl.trainer.config.algorithm import RolloutCorrectionConfig
-from verl.trainer.ppo.core_algos import compute_policy_loss_vanilla
+from verl.trainer.ppo.core_algos import compute_policy_loss_bypass_mode, compute_policy_loss_vanilla
 from verl.trainer.ppo.rollout_corr_helper import (
     compute_offpolicy_metrics,
     compute_rollout_correction_and_rejection_mask,
 )
-from verl.workers.config.actor import ActorConfig
+from verl.workers.config.actor import ActorConfig, PolicyLossConfig
 
 
 class TestRolloutISIntegration:
@@ -92,6 +92,86 @@ class TestRolloutISIntegration:
         assert pg_loss.ndim == 0  # Scalar
         assert not torch.isnan(pg_loss)
         assert not torch.isinf(pg_loss)
+
+    @pytest.mark.parametrize(
+        ("rollout_corr_config", "actor_metric_keys"),
+        [
+            (
+                RolloutCorrectionConfig(
+                    rollout_is=None,
+                    rollout_rs="seq_mean_k3",
+                    rollout_rs_threshold=0.005,
+                    bypass_mode=True,
+                    loss_type="ppo_clip",
+                ),
+                {"actor/pg_clipfrac", "actor/ppo_kl", "actor/pg_clipfrac_lower"},
+            ),
+            (
+                RolloutCorrectionConfig(
+                    rollout_is="token",
+                    rollout_is_threshold="0.5_5.0",
+                    rollout_is_batch_normalize=True,
+                    rollout_rs="seq_mean_k1",
+                    rollout_rs_threshold="0.5_1.5",
+                    bypass_mode=True,
+                    loss_type="reinforce",
+                ),
+                {"actor/ppo_kl"},
+            ),
+        ],
+    )
+    def test_bypass_empty_response_mask_returns_full_metric_keys(self, rollout_corr_config, actor_metric_keys):
+        """Padding-only bypass micro-batches must keep metric keys aligned across DP ranks."""
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        batch_size, seq_length = 2, 4
+
+        rollout_log_prob = torch.zeros(batch_size, seq_length, device=device)
+        log_prob = torch.zeros(batch_size, seq_length, device=device, requires_grad=True)
+        advantages = torch.ones(batch_size, seq_length, device=device)
+        empty_response_mask = torch.zeros(batch_size, seq_length, device=device)
+        non_empty_response_mask = torch.ones(batch_size, seq_length, device=device)
+
+        config = ActorConfig(
+            strategy="fsdp",
+            rollout_n=1,
+            ppo_micro_batch_size=2,
+            clip_ratio=0.2,
+            policy_loss=PolicyLossConfig(
+                loss_mode="bypass_mode",
+                rollout_correction=rollout_corr_config,
+            ),
+        )
+
+        _, _, expected_rollout_metrics = compute_rollout_correction_and_rejection_mask(
+            old_log_prob=log_prob.detach(),
+            rollout_log_prob=rollout_log_prob,
+            response_mask=non_empty_response_mask,
+            rollout_is=rollout_corr_config.rollout_is,
+            rollout_is_threshold=rollout_corr_config.rollout_is_threshold,
+            rollout_is_batch_normalize=rollout_corr_config.rollout_is_batch_normalize,
+            rollout_rs=rollout_corr_config.rollout_rs,
+            rollout_rs_threshold=rollout_corr_config.rollout_rs_threshold,
+        )
+
+        pg_loss, metrics = compute_policy_loss_bypass_mode(
+            old_log_prob=rollout_log_prob,
+            log_prob=log_prob,
+            advantages=advantages,
+            response_mask=empty_response_mask,
+            loss_agg_mode="token-mean",
+            config=config,
+        )
+
+        expected_keys = actor_metric_keys | set(expected_rollout_metrics)
+        expected_keys.add("rollout_corr/all_zero_response_mask_micro_batch")
+
+        assert set(metrics) == expected_keys
+        assert metrics["rollout_corr/all_zero_response_mask_micro_batch"] == 1.0
+        assert metrics["rollout_corr/training_ppl"] == 1.0
+        assert metrics["rollout_corr/ppl_ratio"] == 1.0
+        assert pg_loss.requires_grad
+        pg_loss.backward()
+        assert torch.count_nonzero(log_prob.grad) == 0
 
     def test_rollout_is_weights_computation(self, sample_data):
         """Test rollout correction weights and metrics computation."""

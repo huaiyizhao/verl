@@ -2375,6 +2375,126 @@ def compute_policy_loss_reinforce(
     return pg_loss, pg_metrics
 
 
+def _empty_bypass_rollout_correction_metrics(
+    *,
+    rollout_is: Optional[str],
+    rollout_is_threshold: str | float | None,
+    rollout_is_batch_normalize: bool,
+    rollout_rs: Optional[str],
+    rollout_rs_threshold: str | float | None,
+) -> dict[str, float]:
+    """Return the same rollout-correction metric keys as the non-empty bypass path."""
+    from verl.trainer.ppo.rollout_corr_helper import (
+        SUPPORTED_ROLLOUT_RS_OPTIONS,
+        _parse_rollout_is_threshold,
+        _parse_rollout_rs_thresholds,
+    )
+
+    metrics: dict[str, float] = {}
+
+    if rollout_is is not None and rollout_is_threshold is not None:
+        valid_is_levels = {"token", "sequence"}
+        if rollout_is not in valid_is_levels:
+            raise ValueError(f"Invalid rollout_is: {rollout_is}. Must be one of {valid_is_levels}.")
+
+        _, rollout_is_threshold_lower = _parse_rollout_is_threshold(rollout_is_threshold)
+        is_neutral_one_keys = {
+            "rollout_is_mean",
+            "rollout_is_max",
+            "rollout_is_min",
+            "rollout_is_eff_sample_size",
+            "rollout_is_seq_mean",
+            "rollout_is_seq_max",
+            "rollout_is_seq_min",
+        }
+        is_zero_keys = {
+            "rollout_is_ratio_fraction_high",
+            "rollout_is_ratio_fraction_low",
+            "rollout_is_std",
+            "rollout_is_seq_std",
+            "rollout_is_seq_max_deviation",
+            "rollout_is_seq_fraction_high",
+            "rollout_is_seq_fraction_low",
+        }
+
+        for key in is_neutral_one_keys:
+            metrics[f"rollout_corr/{key}"] = 1.0
+        for key in is_zero_keys:
+            metrics[f"rollout_corr/{key}"] = 0.0
+        if rollout_is_threshold_lower is not None:
+            metrics["rollout_corr/rollout_is_oob_ratio"] = 0.0
+        if rollout_is_batch_normalize:
+            metrics["rollout_corr/rollout_is_batch_norm_factor"] = 1.0
+
+    if rollout_rs is not None:
+        if not isinstance(rollout_rs, str):
+            raise ValueError("rollout_rs must be a non-empty string (comma separated for multiple options).")
+
+        option_modes = [opt.strip() for opt in rollout_rs.split(",") if opt.strip()]
+        if not option_modes:
+            raise ValueError("rollout_rs must contain at least one valid option.")
+
+        normalized_options: list[str] = []
+        seen: set[str] = set()
+        for option_name in option_modes:
+            if option_name not in SUPPORTED_ROLLOUT_RS_OPTIONS:
+                raise ValueError(
+                    f"Invalid rollout_rs option: {option_name}. Must be one of {sorted(SUPPORTED_ROLLOUT_RS_OPTIONS)}."
+                )
+            if option_name not in seen:
+                normalized_options.append(option_name)
+                seen.add(option_name)
+
+        _parse_rollout_rs_thresholds(normalized_options, rollout_rs_threshold)
+
+        rs_suffixes = [
+            "mean",
+            "max",
+            "min",
+            "fraction_high",
+            "fraction_low",
+            "std",
+            "seq_mean",
+            "seq_std",
+            "seq_max",
+            "seq_min",
+            "seq_max_deviation",
+            "seq_fraction_high",
+        ]
+        for option_name in normalized_options:
+            prefix = f"rollout_corr/rollout_rs_{option_name}"
+            for suffix in rs_suffixes:
+                metrics[f"{prefix}_{suffix}"] = 0.0
+            if option_name.endswith("k1"):
+                metrics[f"{prefix}_seq_fraction_low"] = 0.0
+            metrics[f"{prefix}_masked_fraction"] = 0.0
+            metrics[f"{prefix}_seq_masked_fraction"] = 0.0
+
+        metrics["rollout_corr/rollout_rs_masked_fraction"] = 0.0
+        metrics["rollout_corr/rollout_rs_seq_masked_fraction"] = 0.0
+
+    metrics.update(
+        {
+            "rollout_corr/training_ppl": 1.0,
+            "rollout_corr/training_log_ppl": 0.0,
+            "rollout_corr/kl": 0.0,
+            "rollout_corr/k3_kl": 0.0,
+            "rollout_corr/rollout_ppl": 1.0,
+            "rollout_corr/rollout_log_ppl": 0.0,
+            "rollout_corr/log_ppl_diff": 0.0,
+            "rollout_corr/log_ppl_abs_diff": 0.0,
+            "rollout_corr/log_ppl_diff_max": 0.0,
+            "rollout_corr/log_ppl_diff_min": 0.0,
+            "rollout_corr/ppl_ratio": 1.0,
+            "rollout_corr/chi2_token": 0.0,
+            "rollout_corr/chi2_seq": 0.0,
+            "rollout_corr/all_zero_response_mask_micro_batch": 1.0,
+        }
+    )
+
+    return metrics
+
+
 @register_policy_loss("bypass_mode")
 def compute_policy_loss_bypass_mode(
     old_log_prob: torch.Tensor,
@@ -2460,13 +2580,28 @@ def compute_policy_loss_bypass_mode(
         # Padding-only micro-batches can appear after fully-async padding and
         # dynamic micro-batch balancing. They should participate in the
         # distributed backward schedule but contribute no training signal.
+        if loss_type == "ppo_clip":
+            pg_metrics: dict[str, Any] = {
+                "actor/pg_clipfrac": 0.0,
+                "actor/ppo_kl": 0.0,
+                "actor/pg_clipfrac_lower": 0.0,
+            }
+        elif loss_type == "reinforce":
+            pg_metrics = {"actor/ppo_kl": 0.0}
+        else:
+            raise ValueError(f"Invalid loss_type: {loss_type}. Must be 'reinforce' or 'ppo_clip'.")
+
+        pg_metrics.update(
+            _empty_bypass_rollout_correction_metrics(
+                rollout_is=rollout_is,
+                rollout_is_threshold=rollout_is_threshold,
+                rollout_is_batch_normalize=rollout_is_batch_normalize,
+                rollout_rs=rollout_rs,
+                rollout_rs_threshold=rollout_rs_threshold,
+            )
+        )
         zero_loss = log_prob.sum() * 0.0
-        return zero_loss, {
-            "actor/pg_clipfrac": 0.0,
-            "actor/ppo_kl": 0.0,
-            "actor/pg_clipfrac_lower": 0.0,
-            "rollout_corr/all_zero_response_mask_micro_batch": 1.0,
-        }
+        return zero_loss, pg_metrics
 
     # Compute IS weights and rejection mask
     # Note: For PPO-clip, we still compute IS weights for metrics, but don't apply them
