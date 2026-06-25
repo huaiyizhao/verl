@@ -125,6 +125,12 @@ async def _async_meta_to_realdata(meta: BatchMeta | KVBatchMeta) -> TensorDict:
             tensordict[key] = val
         else:
             tu.assign_non_tensor_data(tensor_dict=tensordict, key=key, val=val)
+
+    # Resolve any deduped image references back into multi_modal_inputs (no-op
+    # unless the batch carries an image_ids column, i.e. image dedup is active).
+    from verl.utils.transferqueue_image_dedup import maybe_resolve_image_ids
+
+    tensordict = await maybe_resolve_image_ids(tensordict)
     return tensordict
 
 
