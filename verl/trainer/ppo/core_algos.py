@@ -85,6 +85,15 @@ def get_policy_loss_fn(name):
     return POLICY_LOSS_REGISTRY[loss_name]
 
 
+def _get_grpo_adv_std_floor(config: Optional[AlgoConfig]) -> float:
+    if config is None:
+        return 0.0
+    floor = config.get("grpo_adv_std_floor", 0.0)
+    if floor is None:
+        return 0.0
+    return float(floor)
+
+
 class AdvantageEstimator(str, Enum):
     """Using an enumeration class to avoid spelling errors in adv_estimator.
 
@@ -321,9 +330,13 @@ def compute_grpo_outcome_advantage(
                 id2std[idx] = torch.std(scores_tensor)
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
+        adv_std_floor = _get_grpo_adv_std_floor(config)
         for i in range(bsz):
             if norm_adv_by_std_in_grpo:
-                scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+                std = id2std[index[i]]
+                if adv_std_floor > 0:
+                    std = torch.clamp(std, min=adv_std_floor)
+                scores[i] = (scores[i] - id2mean[index[i]]) / (std + epsilon)
             else:
                 scores[i] = scores[i] - id2mean[index[i]]
         scores = scores.unsqueeze(-1) * response_mask
@@ -351,7 +364,11 @@ def compute_grpo_vectorized_outcome_advantage(
         g = as_torch_index(index, device=scores.device)
         mean_g, std_g, _ = group_mean_std(scores, g, eps=epsilon, device=scores.device)
         if norm_adv_by_std_in_grpo:
-            scalars = (scores - mean_g[g]) / (std_g[g] + epsilon)
+            adv_std_floor = _get_grpo_adv_std_floor(config)
+            denom = std_g[g]
+            if adv_std_floor > 0:
+                denom = torch.clamp(denom, min=adv_std_floor)
+            scalars = (scores - mean_g[g]) / (denom + epsilon)
         else:
             scalars = scores - mean_g[g]
         advantages = scalars.unsqueeze(-1) * response_mask
@@ -523,6 +540,9 @@ def compute_grpo_passk_outcome_advantage(
             advantage = r_max - r_second_max
             if norm_adv_by_std_in_grpo:
                 std = torch.std(rewards)
+                adv_std_floor = _get_grpo_adv_std_floor(config)
+                if adv_std_floor > 0:
+                    std = torch.clamp(std, min=adv_std_floor)
                 advantage = advantage / (std + epsilon)
             advantages[i_max] = advantage
 
@@ -1160,9 +1180,10 @@ def agg_loss(
         dp_size: data parallel size
         batch_num_tokens: number of valid tokens in global batch
         global_batch_size: global batch size
-        loss_scale_factor: scale factor for "seq-mean-token-sum-norm" mode. If None, uses loss_mask.shape[-1].
+        loss_scale_factor: scale factor for seq/rollout "token-sum-norm" modes except
+            "rollout-mean-token-sum-sqrt-norm". If None, uses loss_mask.shape[-1].
             Set this to a constant value to ensure consistent normalization throughout training.
-        rollout_loss_weights: per-token weights where each rollout's valid tokens sum to 1.
+        rollout_loss_weights: base per-token weights where each rollout's valid tokens sum to 1.
         global_rollout_count: number of valid rollout groups in the global batch.
 
     Returns:
@@ -1197,16 +1218,29 @@ def agg_loss(
                 raise ValueError("global_batch_size is required when dp_size > 1")
             global_batch_size = seq_mask.sum()
         loss = verl_F.masked_sum(seq_losses, seq_mask) / global_batch_size * dp_size  # seq-mean
-    elif loss_agg_mode == "rollout-mean-token-mean":
-        if rollout_loss_weights is None:
-            raise ValueError("rollout_loss_weights is required for rollout-mean-token-mean")
+    elif loss_agg_mode in [
+        "rollout-mean-token-mean",
+        "rollout-mean-token-sum-norm",
+        "rollout-mean-token-sum-sqrt-norm",
+    ]:
         if global_rollout_count is None:
             if dp_size > 1:
                 raise ValueError("global_rollout_count is required when dp_size > 1")
             row_has_tokens = torch.sum(loss_mask, dim=-1) > 0
             global_rollout_count = row_has_tokens.sum()
-        weights = rollout_loss_weights.to(loss_mat.device, dtype=loss_mat.dtype)
-        loss = torch.sum(loss_mat * loss_mask.to(loss_mat.dtype) * weights) / global_rollout_count * dp_size
+        mask = loss_mask.to(loss_mat.dtype)
+        if loss_agg_mode == "rollout-mean-token-sum-norm":
+            if loss_scale_factor is None:
+                horizon = loss_mask.shape[-1]
+                loss_scale_factor = horizon
+            loss = torch.sum(loss_mat * mask) / loss_scale_factor / global_rollout_count * dp_size
+        else:
+            if rollout_loss_weights is None:
+                raise ValueError(f"rollout_loss_weights is required for {loss_agg_mode}")
+            weights = rollout_loss_weights.to(loss_mat.device, dtype=loss_mat.dtype)
+            if loss_agg_mode == "rollout-mean-token-sum-sqrt-norm":
+                weights = torch.sqrt(torch.clamp(weights, min=0.0))
+            loss = torch.sum(loss_mat * mask * weights) / global_rollout_count * dp_size
     else:
         raise ValueError(f"Invalid loss_agg_mode: {loss_agg_mode}")
 

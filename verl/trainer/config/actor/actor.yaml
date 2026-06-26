@@ -78,10 +78,13 @@ policy_loss:
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
 
-# Loss aggregation mode: "token-mean", "seq-mean-token-sum", "seq-mean-token-mean", "seq-mean-token-sum-norm", or "rollout-mean-token-mean"
+# Loss aggregation mode: "token-mean", "seq-mean-token-sum", "seq-mean-token-mean",
+# "seq-mean-token-sum-norm", "rollout-mean-token-mean",
+# "rollout-mean-token-sum-norm", or "rollout-mean-token-sum-sqrt-norm"
 loss_agg_mode: token-mean
 
-# Scale factor for "seq-mean-token-sum-norm" loss aggregation mode.
+# Scale factor for seq/rollout "token-sum-norm" modes except
+# "rollout-mean-token-sum-sqrt-norm".
 # If null, uses response_length. Set to a constant to ensure consistent normalization.
 loss_scale_factor: null
 
@@ -314,4 +317,3 @@ qat:
 
   # Path to vLLM quantization config JSON file
   quantization_config_path: null
-

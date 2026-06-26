@@ -138,6 +138,144 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
+def _config_get(config: Optional[AlgoConfig], key: str, default):
+    if config is None:
+        return default
+    return config.get(key, default)
+
+
+def _to_float_array(values, expected_len: int) -> np.ndarray | None:
+    if values is None:
+        return None
+    if isinstance(values, torch.Tensor):
+        raw_values = values.detach().cpu().flatten().tolist()
+    elif hasattr(values, "tolist"):
+        raw_values = values.tolist()
+    else:
+        raw_values = list(values)
+    if len(raw_values) != expected_len:
+        return None
+
+    parsed = []
+    for value in raw_values:
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().item() if value.numel() == 1 else None
+        elif isinstance(value, np.ndarray):
+            value = value.item() if value.size == 1 else None
+        elif isinstance(value, list | tuple) and len(value) == 1:
+            value = value[0]
+        if value is None:
+            parsed.append(np.nan)
+            continue
+        try:
+            parsed.append(float(value))
+        except (TypeError, ValueError):
+            parsed.append(np.nan)
+    return np.asarray(parsed, dtype=np.float32)
+
+
+def _extract_base_rewards(non_tensor_batch: dict, expected_len: int) -> np.ndarray | None:
+    base_rewards = _to_float_array(non_tensor_batch.get("base_reward"), expected_len)
+    if base_rewards is not None:
+        return base_rewards
+
+    for key in ("reward_extra_info", "extra_fields"):
+        values = non_tensor_batch.get(key)
+        if values is None:
+            continue
+        raw_values = values.tolist() if hasattr(values, "tolist") else list(values)
+        if len(raw_values) != expected_len:
+            continue
+        parsed = []
+        for value in raw_values:
+            info = value.get("reward_extra_info", value) if isinstance(value, dict) else {}
+            parsed.append(info.get("base_reward") if isinstance(info, dict) else None)
+        base_rewards = _to_float_array(parsed, expected_len)
+        if base_rewards is not None:
+            return base_rewards
+    return None
+
+
+def _extract_assistant_turns(non_tensor_batch: dict, expected_len: int) -> np.ndarray | None:
+    for key in ("assistant_turn", "turn_number", "turn"):
+        turns = _to_float_array(non_tensor_batch.get(key), expected_len)
+        if turns is not None:
+            return turns
+
+    for key in ("__num_turns__", "num_turns"):
+        turns = _to_float_array(non_tensor_batch.get(key), expected_len)
+        if turns is not None:
+            return turns / 2.0
+
+    values = non_tensor_batch.get("extra_fields")
+    if values is None:
+        return None
+    raw_values = values.tolist() if hasattr(values, "tolist") else list(values)
+    if len(raw_values) != expected_len:
+        return None
+    parsed = []
+    for value in raw_values:
+        parsed.append(value.get("turn_number") if isinstance(value, dict) else None)
+    return _to_float_array(parsed, expected_len)
+
+
+def _apply_all_zero_fail_turn_advantage(
+    data: DataProto,
+    index: np.ndarray,
+    config: Optional[AlgoConfig],
+) -> None:
+    coef = float(_config_get(config, "fail_turn_adv_coef", 0.0) or 0.0)
+    if coef <= 0 or "advantages" not in data.batch.keys():
+        return
+
+    non_tensor_batch = data.non_tensor_batch or {}
+    batch_size = data.batch["advantages"].shape[0]
+    base_rewards = _extract_base_rewards(non_tensor_batch, batch_size)
+    turns = _extract_assistant_turns(non_tensor_batch, batch_size)
+    if base_rewards is None or turns is None:
+        return
+
+    max_turns = float(_config_get(config, "fail_turn_max_turns", 50.0) or 50.0)
+    if max_turns <= 0:
+        return
+    base_eps = float(_config_get(config, "fail_turn_base_reward_eps", 1e-8) or 1e-8)
+
+    bonus_scalars = np.zeros(batch_size, dtype=np.float32)
+    applied_groups = 0
+    for group_id in dict.fromkeys(index.tolist()):
+        group_mask = index == group_id
+        group_base_rewards = base_rewards[group_mask]
+        group_turns = turns[group_mask]
+        if not (np.isfinite(group_base_rewards).all() and np.isfinite(group_turns).all()):
+            continue
+        if not np.all(np.abs(group_base_rewards) <= base_eps):
+            continue
+        mean_turn = float(group_turns.mean())
+        bonus_scalars[group_mask] = coef * (mean_turn - group_turns) / max_turns
+        applied_groups += 1
+
+    if applied_groups == 0:
+        return
+
+    response_mask = data.batch["response_mask"].to(data.batch["advantages"].dtype)
+    bonus = (
+        torch.as_tensor(
+            bonus_scalars,
+            device=data.batch["advantages"].device,
+            dtype=data.batch["advantages"].dtype,
+        ).unsqueeze(-1)
+        * response_mask
+    )
+    data.batch["advantages"] = data.batch["advantages"] + bonus
+    if "returns" in data.batch.keys():
+        data.batch["returns"] = data.batch["returns"] + bonus
+
+    if data.meta_info is None:
+        data.meta_info = {}
+    data.meta_info["algorithm/fail_turn_adv/applied_groups"] = applied_groups
+    data.meta_info["algorithm/fail_turn_adv/max_abs"] = float(np.max(np.abs(bonus_scalars)))
+
+
 def compute_advantage(
     data: DataProto,
     adv_estimator: AdvantageEstimator,
@@ -196,9 +334,11 @@ def compute_advantage(
             response_mask=grpo_calculation_mask,
             index=data.non_tensor_batch["uid"],
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            config=config,
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
+        _apply_all_zero_fail_turn_advantage(data, data.non_tensor_batch["uid"], config)
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)

@@ -789,6 +789,10 @@ algorithm:
   lam: 1.0
   adv_estimator: gae
   norm_adv_by_std_in_grpo: true
+  grpo_adv_std_floor: 0.0
+  fail_turn_adv_coef: 0.02
+  fail_turn_max_turns: 50.0
+  fail_turn_base_reward_eps: 1.0e-08
   use_kl_in_reward: false
   kl_penalty: kl
   kl_ctrl:

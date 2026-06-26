@@ -1335,15 +1335,42 @@ class PPOTrainer:
 
     def _compute_advantage(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the advantage of the batch."""
-        fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
+        fields = [
+            "uid",
+            "response_mask",
+            "rm_scores",
+            "rollout_log_probs",
+            "old_log_probs",
+            "ref_log_prob",
+            "values",
+            "num_turns",
+            "extra_fields",
+        ]
         t_start = time.time()
         data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+        num_turns = data.pop("num_turns", None)
+        extra_fields = data.pop("extra_fields", None)
         response_mask = data["response_mask"]
         t_end = time.time()
         print(f"[DEBUG] _compute_advantage time to get data: {t_end - t_start:.2f}", flush=True)
         data = DataProto(batch=data.to_padded_tensor())
         data.batch["token_level_scores"] = data.batch["rm_scores"]
         data.non_tensor_batch["uid"] = np.array(data.batch.pop("uid").tolist(), dtype=object)
+        if num_turns is not None:
+            data.non_tensor_batch["num_turns"] = np.array(num_turns.tolist(), dtype=np.float32)
+        if extra_fields is not None:
+            extra_fields_list = extra_fields.tolist()
+            data.non_tensor_batch["extra_fields"] = np.array(extra_fields_list, dtype=object)
+            base_rewards = []
+            turn_numbers = []
+            for extra_field in extra_fields_list:
+                reward_extra_info = extra_field.get("reward_extra_info", {}) if isinstance(extra_field, dict) else {}
+                base_rewards.append(
+                    reward_extra_info.get("base_reward") if isinstance(reward_extra_info, dict) else None
+                )
+                turn_numbers.append(extra_field.get("turn_number") if isinstance(extra_field, dict) else None)
+            data.non_tensor_batch["base_reward"] = np.array(base_rewards, dtype=object)
+            data.non_tensor_batch["turn_number"] = np.array(turn_numbers, dtype=object)
 
         # 1. apply kl penalty to rewards
         if self.config.algorithm.use_kl_in_reward:
