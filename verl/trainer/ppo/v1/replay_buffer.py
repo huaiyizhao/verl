@@ -139,6 +139,29 @@ class ReplayBuffer:
                         partition[key] = {}
                     partition[key].update(tag)
 
+    def count_inflight(self, partition_id: str = "train") -> dict[str, int]:
+        """Return the current TransferQueue prompt counts, for throttling the streaming feeder.
+
+        - pending + running: prompts that are fed but not yet consumable.
+        - finished + failure: prompts that are ready to be sampled but not yet consumed.
+
+        The streaming feeder bounds the sum of all four (total un-consumed prompts) to keep
+        the rollouter from running arbitrarily far ahead of training.
+
+        Args:
+            partition_id (str): Partition of TransferQueue, e.g. "train" or "val".
+
+        Returns:
+            dict: Counts keyed by "pending", "running", "finished", "failure".
+        """
+        self._sync_metadata_from_transfer_queue()
+        return {
+            "pending": len(self.pending_keys[partition_id]),
+            "running": len(self.running_keys[partition_id]),
+            "finished": len(self.finished_keys[partition_id]),
+            "failure": len(self.failure_keys[partition_id]),
+        }
+
     def _has_enough_samples(self, global_steps: int, partition_id: str, batch_size: int) -> bool:
         # For wait strategy, we need to wait all trajectories that reach threshold to finish
         if self.max_off_policy_strategy == "wait":

@@ -206,7 +206,7 @@ trainer:
   # V1 trainer mode configs
   v1:
 
-    # Trainer mode: "sync", "colocate_async", "separate_async"
+    # Trainer mode: "sync", "colocate_async", "separate_async", "fully_async"
     trainer_mode: sync
 
     # Synchronous PPO trainer
@@ -226,6 +226,24 @@ trainer:
 
       # Frequency of parameter synchronization between trainer and rollout,
       parameter_sync_step: 4
+
+    # Streaming (fully asynchronous) PPO trainer: an autonomous background feeder continuously
+    # streams prompts into TransferQueue (bounded by a staleness / in-flight budget), while the
+    # trainer step only samples + trains. Builds on separate_async (standalone rollout).
+    fully_async:
+
+      # Number of warmup batches to feed before the autonomous feeder starts
+      num_warmup_batches: 4
+
+      # Frequency (in training steps) of parameter synchronization between trainer and rollout
+      parameter_sync_step: 4
+
+      # Off-policy staleness budget (in parameter-sync units) used to size the in-flight prompt
+      # budget: max_inflight_prompts = (1 + staleness_threshold) * parameter_sync_step * train_batch_size
+      staleness_threshold: 1
+
+      # Seconds the feeder sleeps when the in-flight budget is full (avoids busy-waiting)
+      feeder_poll_interval: 1.0
 
     # Replay buffer sampling strategy
     sampler:

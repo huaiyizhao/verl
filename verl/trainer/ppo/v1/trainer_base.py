@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import os
+import threading
 import uuid
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -107,6 +108,12 @@ class PPOTrainer(ABC):
 
     def __init__(self, config: DictConfig):
         self.config = config
+        # When True, an autonomous background feeder owns prompt generation and `step()`
+        # must not feed a batch itself (set by the streaming `fully_async` trainer mode).
+        self._feeder_owns_generation = False
+        # Serializes access to the (non-thread-safe) train dataloader iterator between the
+        # main thread (checkpoint save) and the streaming feeder thread.
+        self._dataloader_lock = threading.Lock()
         self.use_critic = need_critic(self.config)
         self.use_reference_policy = need_reference_policy(self.config)
         self.use_teacher_policy = need_teacher_policy(self.config)
@@ -404,8 +411,9 @@ class PPOTrainer(ABC):
         self._shutdown_dump_executor()
 
     def step(self, metrics: dict, timing_raw: dict) -> KVBatchMeta:
-        # 1. add batch to generate
-        self._add_batch_to_generate()
+        # 1. add batch to generate (skipped when an autonomous feeder owns generation)
+        if not self._feeder_owns_generation:
+            self._add_batch_to_generate()
 
         # 2. sample batch from replay buffer
         with marked_timer("gen", timing_raw, color="red"):
@@ -726,7 +734,11 @@ class PPOTrainer(ABC):
         # save dataloader state
         local_mkdir_safe(local_global_step_folder)
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
-        torch.save(self.train_dataloader.state_dict(), dataloader_local_path)
+        # Guard against the streaming feeder thread iterating the dataloader concurrently;
+        # StatefulDataLoader.state_dict() mid-iteration is otherwise undefined.
+        with self._dataloader_lock:
+            dataloader_state_dict = self.train_dataloader.state_dict()
+        torch.save(dataloader_state_dict, dataloader_local_path)
 
         # write latest checkpointed iteration tracker for atomic resume
         actor_ckpt_cfg = self.config.actor_rollout_ref.actor.get("checkpoint", {})
@@ -1094,21 +1106,33 @@ class PPOTrainer(ABC):
                 self.critic_wg.stop_profile()
 
     def _add_batch_to_generate(self):
-        """Sample a batch from dataloader and add to AgentLoopManager."""
-        try:
-            if self.train_dataloader_it is None:
+        """Sample a batch from dataloader and add to AgentLoopManager (main-thread default)."""
+        self._feed_one_batch(global_steps=self.global_steps)
+
+    def _feed_one_batch(self, global_steps: int):
+        """Pull one batch from the dataloader, tag its prompts with ``global_steps``, register
+        them in TransferQueue, and dispatch generation.
+
+        Factored out of :meth:`_add_batch_to_generate` so the streaming feeder thread can call
+        it with an explicit parameter version. Dataloader iteration is guarded by
+        ``self._dataloader_lock`` because ``StatefulDataLoader`` is not thread-safe (the main
+        thread reads ``state_dict()`` during checkpoint save).
+        """
+        with self._dataloader_lock:
+            try:
+                if self.train_dataloader_it is None:
+                    self.train_dataloader_it = iter(self.train_dataloader)
+                batch_dict = next(self.train_dataloader_it)
+            except StopIteration:
                 self.train_dataloader_it = iter(self.train_dataloader)
-            batch_dict = next(self.train_dataloader_it)
-        except StopIteration:
-            self.train_dataloader_it = iter(self.train_dataloader)
-            batch_dict = next(self.train_dataloader_it)
+                batch_dict = next(self.train_dataloader_it)
 
         batch_dict["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch_dict["raw_prompt"]))], dtype=object)
         batch = tu.get_tensordict(batch_dict)
-        tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
+        tu.assign_non_tensor_data(batch, "global_steps", global_steps)
 
         # Register each prompt (GRPO group) in TransferQueue as a tag-only status marker
-        tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps}] * len(batch)
+        tags = [{"is_prompt": True, "status": "pending", "global_steps": global_steps}] * len(batch)
         tq.kv_batch_put(keys=list(batch["uid"]), partition_id="train", tags=tags)
 
         # add batch to agent loop manager
