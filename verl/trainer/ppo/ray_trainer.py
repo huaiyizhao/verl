@@ -196,6 +196,28 @@ def _extract_base_rewards(non_tensor_batch: dict, expected_len: int) -> np.ndarr
     return None
 
 
+def _extract_float_metadata(non_tensor_batch: dict, field_name: str, expected_len: int) -> np.ndarray | None:
+    values = _to_float_array(non_tensor_batch.get(field_name), expected_len)
+    if values is not None:
+        return values
+
+    for key in ("reward_extra_info", "extra_fields"):
+        raw_container = non_tensor_batch.get(key)
+        if raw_container is None:
+            continue
+        raw_values = raw_container.tolist() if hasattr(raw_container, "tolist") else list(raw_container)
+        if len(raw_values) != expected_len:
+            continue
+        parsed = []
+        for value in raw_values:
+            info = value.get("reward_extra_info", value) if isinstance(value, dict) else {}
+            parsed.append(info.get(field_name) if isinstance(info, dict) else None)
+        values = _to_float_array(parsed, expected_len)
+        if values is not None:
+            return values
+    return None
+
+
 def _extract_assistant_turns(non_tensor_batch: dict, expected_len: int) -> np.ndarray | None:
     for key in ("assistant_turn", "turn_number", "turn"):
         turns = _to_float_array(non_tensor_batch.get(key), expected_len)
@@ -219,41 +241,54 @@ def _extract_assistant_turns(non_tensor_batch: dict, expected_len: int) -> np.nd
     return _to_float_array(parsed, expected_len)
 
 
-def _apply_all_zero_fail_turn_advantage(
+def _apply_all_zero_fail_aux_advantage(
     data: DataProto,
     index: np.ndarray,
     config: Optional[AlgoConfig],
 ) -> None:
-    coef = float(_config_get(config, "fail_turn_adv_coef", 0.0) or 0.0)
-    if coef <= 0 or "advantages" not in data.batch.keys():
+    if "advantages" not in data.batch.keys():
         return
 
     non_tensor_batch = data.non_tensor_batch or {}
     batch_size = data.batch["advantages"].shape[0]
     base_rewards = _extract_base_rewards(non_tensor_batch, batch_size)
-    turns = _extract_assistant_turns(non_tensor_batch, batch_size)
-    if base_rewards is None or turns is None:
+    if base_rewards is None:
         return
 
+    loop_coef = float(_config_get(config, "fail_loop_no_change_adv_coef", 0.0) or 0.0)
+    loop_scores = _extract_float_metadata(non_tensor_batch, "loop_no_change_score", batch_size)
+    turn_coef = float(_config_get(config, "fail_turn_adv_coef", 0.0) or 0.0)
+    turns = _extract_assistant_turns(non_tensor_batch, batch_size)
     max_turns = float(_config_get(config, "fail_turn_max_turns", 50.0) or 50.0)
-    if max_turns <= 0:
-        return
     base_eps = float(_config_get(config, "fail_turn_base_reward_eps", 1e-8) or 1e-8)
 
     bonus_scalars = np.zeros(batch_size, dtype=np.float32)
-    applied_groups = 0
+    loop_applied_groups = 0
+    turn_applied_groups = 0
     for group_id in dict.fromkeys(index.tolist()):
         group_mask = index == group_id
         group_base_rewards = base_rewards[group_mask]
-        group_turns = turns[group_mask]
-        if not (np.isfinite(group_base_rewards).all() and np.isfinite(group_turns).all()):
+        if not np.isfinite(group_base_rewards).all():
             continue
         if not np.all(np.abs(group_base_rewards) <= base_eps):
             continue
-        mean_turn = float(group_turns.mean())
-        bonus_scalars[group_mask] = coef * (mean_turn - group_turns) / max_turns
-        applied_groups += 1
 
+        if loop_coef > 0 and loop_scores is not None:
+            group_loop_scores = loop_scores[group_mask]
+            if np.isfinite(group_loop_scores).all():
+                mean_loop_score = float(group_loop_scores.mean())
+                bonus_scalars[group_mask] = loop_coef * (mean_loop_score - group_loop_scores)
+                loop_applied_groups += 1
+                continue
+
+        if turn_coef > 0 and turns is not None and max_turns > 0:
+            group_turns = turns[group_mask]
+            if np.isfinite(group_turns).all():
+                mean_turn = float(group_turns.mean())
+                bonus_scalars[group_mask] = turn_coef * (mean_turn - group_turns) / max_turns
+                turn_applied_groups += 1
+
+    applied_groups = loop_applied_groups + turn_applied_groups
     if applied_groups == 0:
         return
 
@@ -272,8 +307,10 @@ def _apply_all_zero_fail_turn_advantage(
 
     if data.meta_info is None:
         data.meta_info = {}
-    data.meta_info["algorithm/fail_turn_adv/applied_groups"] = applied_groups
-    data.meta_info["algorithm/fail_turn_adv/max_abs"] = float(np.max(np.abs(bonus_scalars)))
+    data.meta_info["algorithm/fail_aux_adv/applied_groups"] = applied_groups
+    data.meta_info["algorithm/fail_aux_adv/loop_applied_groups"] = loop_applied_groups
+    data.meta_info["algorithm/fail_aux_adv/turn_applied_groups"] = turn_applied_groups
+    data.meta_info["algorithm/fail_aux_adv/max_abs"] = float(np.max(np.abs(bonus_scalars)))
 
 
 def compute_advantage(
@@ -338,7 +375,7 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
-        _apply_all_zero_fail_turn_advantage(data, data.non_tensor_batch["uid"], config)
+        _apply_all_zero_fail_aux_advantage(data, data.non_tensor_batch["uid"], config)
     else:
         # handle all other adv estimator type other than GAE and GRPO
         adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)

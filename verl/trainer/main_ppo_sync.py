@@ -1363,14 +1363,19 @@ class PPOTrainer:
             data.non_tensor_batch["extra_fields"] = np.array(extra_fields_list, dtype=object)
             base_rewards = []
             turn_numbers = []
+            loop_no_change_scores = []
             for extra_field in extra_fields_list:
                 reward_extra_info = extra_field.get("reward_extra_info", {}) if isinstance(extra_field, dict) else {}
                 base_rewards.append(
                     reward_extra_info.get("base_reward") if isinstance(reward_extra_info, dict) else None
                 )
                 turn_numbers.append(extra_field.get("turn_number") if isinstance(extra_field, dict) else None)
+                loop_no_change_scores.append(
+                    reward_extra_info.get("loop_no_change_score") if isinstance(reward_extra_info, dict) else None
+                )
             data.non_tensor_batch["base_reward"] = np.array(base_rewards, dtype=object)
             data.non_tensor_batch["turn_number"] = np.array(turn_numbers, dtype=object)
+            data.non_tensor_batch["loop_no_change_score"] = np.array(loop_no_change_scores, dtype=object)
 
         # 1. apply kl penalty to rewards
         if self.config.algorithm.use_kl_in_reward:

@@ -76,9 +76,13 @@ algorithm:
   # Minimum std denominator when normalizing GRPO advantages. 0 disables the floor.
   grpo_adv_std_floor: 0.0
 
-  # Small extra advantage for all-zero-base-reward GRPO groups:
-  # fail_turn_adv_coef * (mean_turn - turn) / fail_turn_max_turns.
-  # Requires per-sample base_reward and turn metadata; skipped when unavailable.
+  # Small extra advantage for all-zero-base-reward GRPO groups.
+  # Prefer GUI loop badness when loop_no_change_score is available:
+  #   fail_loop_no_change_adv_coef * (mean_badness - badness)
+  # Fallback when unavailable:
+  #   fail_turn_adv_coef * (mean_turn - turn) / fail_turn_max_turns.
+  # Both are skipped when required per-sample metadata is unavailable.
+  fail_loop_no_change_adv_coef: 0.02
   fail_turn_adv_coef: 0.02
   fail_turn_max_turns: 50.0
   fail_turn_base_reward_eps: 1e-8

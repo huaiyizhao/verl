@@ -297,6 +297,8 @@ actor_rollout_ref:
       default_agent_loop: single_turn_agent
       agent_loop_config_path: null
       turn_penalty_coef: 0.0
+      loop_no_change_repeat_min: 5
+      loop_no_change_diff_threshold: 2.0
       custom_async_server:
         _target_: verl.workers.config.CustomAsyncServerConfig
         path: null
@@ -726,6 +728,7 @@ algorithm:
   adv_estimator: gae
   norm_adv_by_std_in_grpo: true
   grpo_adv_std_floor: 0.0
+  fail_loop_no_change_adv_coef: 0.02
   fail_turn_adv_coef: 0.02
   fail_turn_max_turns: 50.0
   fail_turn_base_reward_eps: 1.0e-08

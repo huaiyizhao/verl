@@ -252,6 +252,13 @@ agent:
   # The GUI agent applies: final_reward = base_reward - coef * (turn - 1) / max_assistant_turns.
   turn_penalty_coef: 0.0
 
+  # GUI loop detection for repeated identical actions that leave the screenshot nearly unchanged.
+  # A badness event is counted after this many consecutive same-action/no-change steps.
+  loop_no_change_repeat_min: 5
+
+  # Mean absolute grayscale diff threshold on a 32x18 screenshot fingerprint.
+  loop_no_change_diff_threshold: 2.0
+
   # custom async server configs
   custom_async_server:
 
