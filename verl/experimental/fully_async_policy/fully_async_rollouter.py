@@ -17,6 +17,7 @@ import logging
 import multiprocessing
 import os
 import time
+import tracemalloc
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pprint import pformat
 
@@ -55,6 +56,121 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 IMAGE_REF_STORAGE_MODE = os.getenv("VERL_IMAGE_REF_STORAGE_MODE", "per_image").strip().lower()
 IMAGE_REF_PUT_WORKERS = max(1, int(os.getenv("VERL_IMAGE_REF_PUT_WORKERS", "8")))
+
+# ----------------------------------------------------------------------------
+# Memory tracing (to locate where the rollouter actor's RSS is spent).
+#
+# The rollouter is a single Ray actor that holds, at any moment:
+#   * ``pending_queue`` backlog of raw RolloutSamples (prompts),
+#   * in-flight ``full_batch`` data for every active rollout (multi-turn image
+#     data lives here until image-ref postprocess strips it out),
+#   * processed image banks being ``ray.put`` into the shared object store.
+#
+# RSS alone cannot tell these apart, so the helpers below split memory into:
+#   * ``rss``  - total resident (includes mmapped object-store pages),
+#   * ``uss``  - unique-to-this-process pages (the real Python-heap footprint;
+#                a rising USS is the signature of a true in-process leak),
+#   * ``shared`` = rss - uss (object-store / shared-lib pages),
+# plus node-level system memory and the Ray object-store usage.
+#
+# Always-on logging is cheap (a couple of /proc reads at a slow cadence).
+# The expensive per-stage DataProto byte walk and tracemalloc snapshots are
+# gated behind env flags so they can be turned on only while debugging.
+# ----------------------------------------------------------------------------
+MEM_TRACE_ENABLED = str(os.getenv("VERL_ROLLOUTER_MEM_TRACE", "1")).lower() not in {"0", "false", "no"}
+# Per-stage DataProto byte accounting (walks multi_modal_data; O(rows*images)).
+MEM_TRACE_DEEP = str(os.getenv("VERL_ROLLOUTER_MEM_TRACE_DEEP", "0")).lower() not in {"0", "false", "no"}
+# tracemalloc top-N python allocation sites, logged from the monitor loop.
+MEM_TRACE_TRACEMALLOC_TOPN = int(os.getenv("VERL_ROLLOUTER_TRACEMALLOC_TOPN", "0"))
+
+_GB = float(1024**3)
+
+
+def _proc_mem_snapshot(proc: psutil.Process) -> dict[str, float]:
+    """Return RSS / USS / shared (GB) for ``proc``.
+
+    ``USS`` (unique set size) excludes pages shared with other processes such
+    as the Ray plasma/object-store mmaps, so ``rss - uss`` approximates how
+    much of the resident footprint is shared object-store memory vs. private
+    Python-heap memory. ``memory_full_info`` reads /proc/<pid>/smaps and is a
+    little more expensive than ``memory_info`` but fine at a slow cadence.
+    """
+    try:
+        info = proc.memory_full_info()
+        rss = info.rss / _GB
+        uss = getattr(info, "uss", 0) / _GB
+        return {"rss_gb": rss, "uss_gb": uss, "shared_gb": max(0.0, rss - uss)}
+    except Exception:
+        rss = proc.memory_info().rss / _GB
+        return {"rss_gb": rss, "uss_gb": 0.0, "shared_gb": 0.0}
+
+
+def _children_rss_gb(proc: psutil.Process) -> tuple[float, int]:
+    """Summed RSS (GB) and count of child processes (env workers, etc.)."""
+    total = 0.0
+    n = 0
+    try:
+        for child in proc.children(recursive=True):
+            try:
+                total += child.memory_info().rss / _GB
+                n += 1
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+    except Exception:
+        pass
+    return total, n
+
+
+def _object_store_used_gb() -> float:
+    """Best-effort Ray object-store bytes currently used on this cluster (GB).
+
+    ``object_store_memory`` appears in both ``cluster_resources`` (capacity)
+    and ``available_resources`` (free); the difference is what live ``ray.put``
+    objects occupy. Returns -1.0 if Ray cannot answer cheaply.
+    """
+    try:
+        total = ray.cluster_resources().get("object_store_memory", 0.0)
+        avail = ray.available_resources().get("object_store_memory", 0.0)
+        return max(0.0, (total - avail)) / _GB
+    except Exception:
+        return -1.0
+
+
+def _dataproto_size_summary(batch: DataProto | None, deep: bool) -> dict[str, float]:
+    """Cheap byte/shape summary of a DataProto.
+
+    Tensor bytes are always summed (a handful of keys, O(1) each). The
+    multi_modal_data image walk is only done when ``deep`` is set because it
+    is O(rows * images) and touches every pixel array.
+    """
+    out = {"rows": 0, "tensor_mb": 0.0, "image_mb": 0.0, "n_images": 0}
+    if batch is None:
+        return out
+    try:
+        out["rows"] = len(batch)
+    except Exception:
+        out["rows"] = 0
+    tb = 0
+    if getattr(batch, "batch", None) is not None:
+        for v in batch.batch.values():
+            if torch.is_tensor(v):
+                tb += v.element_size() * v.nelement()
+    out["tensor_mb"] = tb / (1024**2)
+    if deep:
+        img_bytes = 0
+        n_img = 0
+        nt = getattr(batch, "non_tensor_batch", None) or {}
+        mm = nt.get("multi_modal_data")
+        if mm is not None:
+            for row in mm:
+                images = row.get("images") if isinstance(row, dict) else None
+                for im in images or []:
+                    n_img += 1
+                    arr = np.asarray(im)
+                    img_bytes += int(arr.nbytes)
+        out["image_mb"] = img_bytes / (1024**2)
+        out["n_images"] = n_img
+    return out
 
 
 class FullyAsyncAgentLoopManager(AgentLoopManager):
@@ -221,6 +337,18 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.staleness_samples = 0
         self.dropped_stale_samples = 0
         self.processed_sample_count = 0
+
+        # --- Memory tracing state ---------------------------------------
+        # Handle to this actor's own process for repeated cheap RSS/USS reads.
+        self._mem_proc = psutil.Process(os.getpid())
+        # Cumulative image-bank bytes observed (raw / processed) so the monitor
+        # can show a running total alongside the instantaneous in-flight load.
+        self._mem_cum_image_raw_mb = 0.0
+        self._mem_cum_image_proc_mb = 0.0
+        self._mem_peak_full_batch_mb = 0.0
+        if MEM_TRACE_ENABLED and MEM_TRACE_TRACEMALLOC_TOPN > 0 and not tracemalloc.is_tracing():
+            tracemalloc.start(int(os.getenv("VERL_ROLLOUTER_TRACEMALLOC_FRAMES", "1")))
+            logger.info("[FullyAsyncRollouter][MemTrace] tracemalloc started (top_n=%d)", MEM_TRACE_TRACEMALLOC_TOPN)
         # we start from step 1
         self.global_steps = 1
         self.idle_start_time = time.time()
@@ -801,6 +929,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 metrics.extend(item_metrics)
         ret.meta_info["metrics"] = metrics
         rollout_sample.full_batch = ret
+        # Peak in-flight footprint: multi-turn screenshots are still inline in
+        # ``full_batch`` here (image-ref postprocess strips them later).
+        self._log_mem("after_rollout_concat", sample_id=rollout_sample.sample_id, batch=ret)
 
         # If all rollouts in this sample were discarded (e.g. env creation
         # failures), do not put the empty batch into the message queue.
@@ -861,6 +992,21 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         image_bank_stats["total_ms"] = (time.time() - image_ref_start) * 1000.0
         rollout_sample.image_bank_ref = image_bank_ref
         rollout_sample.image_bank_stats = image_bank_stats
+        # Track how much image payload this sample pushed into the object store,
+        # and how big the post-strip batch is (should be tensor-only now).
+        raw_mb = float(image_bank_stats.get("raw_bytes", 0)) / (1024**2)
+        proc_mb = float(image_bank_stats.get("processed_bytes", 0)) / (1024**2)
+        self._mem_cum_image_raw_mb += raw_mb
+        self._mem_cum_image_proc_mb += proc_mb
+        self._log_mem(
+            "after_image_refs",
+            sample_id=rollout_sample.sample_id,
+            batch=rollout_sample.full_batch,
+            unique_images=image_bank_stats.get("unique_images", 0),
+            bank_raw_mb=f"{raw_mb:.1f}",
+            bank_processed_mb=f"{proc_mb:.1f}",
+            object_store_used_gb=f"{_object_store_used_gb():.3f}",
+        )
         return rollout_sample
 
     def _put_image_objects_parallel(self, image_bank: dict[str, dict]) -> dict[str, ray.ObjectRef]:
@@ -904,6 +1050,13 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 self.dropped_stale_samples += 1
                 self.staleness_samples = max(0, self.staleness_samples - 1)
             self.processed_sample_count += 1
+            # Sample handed to the trainer (or rejected): this actor should now
+            # drop its local references. RSS that does NOT fall back here across
+            # samples points at a retained RolloutSample / object-store backlog.
+            sample_id = rollout_sample.sample_id
+            rollout_sample = None
+            sample_ref = None
+            self._log_mem("after_mq_put", sample_id=sample_id, mq_put_success=success)
         except Exception as exc:
             logger.error(
                 "[POTENTIAL ERROR][FullyAsyncRollouter] postprocess dropped sample_id=%s: %r",
@@ -1024,6 +1177,65 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         logger.info("[FullyAsyncRollouter] Rollouter fit completed")
 
+    def _log_mem(self, stage: str, sample_id: str = "", batch: DataProto | None = None, **extra) -> None:
+        """Emit a one-line per-stage memory marker for offline trend analysis.
+
+        Format mirrors the trainer's ``[StageTime]`` markers so the same log
+        scrapers work. Cheap fields (RSS/USS/queues) are always emitted; the
+        DataProto byte breakdown only when ``VERL_ROLLOUTER_MEM_TRACE_DEEP=1``.
+        """
+        if not MEM_TRACE_ENABLED:
+            return
+        try:
+            snap = _proc_mem_snapshot(self._mem_proc)
+            size = _dataproto_size_summary(batch, MEM_TRACE_DEEP) if batch is not None else None
+            if size is not None:
+                self._mem_peak_full_batch_mb = max(self._mem_peak_full_batch_mb, size["tensor_mb"] + size["image_mb"])
+            ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+            parts = [
+                f"[FullyAsyncRollouter][MemTrace][{stage}]",
+                f"ts={ts}",
+                f"pid={os.getpid()}",
+                f"sample_id={sample_id or '-'}",
+                f"rss={snap['rss_gb']:.3f}GB",
+                f"uss={snap['uss_gb']:.3f}GB",
+                f"shared={snap['shared_gb']:.3f}GB",
+                f"pending_q={self.pending_queue.qsize()}",
+                f"active={len(self.active_tasks)}",
+                f"postproc={len(self.postprocess_tasks)}",
+                f"staleness={self.staleness_samples}",
+            ]
+            if size is not None:
+                parts.append(f"rows={size['rows']}")
+                parts.append(f"batch_tensor={size['tensor_mb']:.1f}MB")
+                if MEM_TRACE_DEEP:
+                    parts.append(f"batch_img={size['image_mb']:.1f}MB")
+                    parts.append(f"n_img={size['n_images']}")
+            for k, v in extra.items():
+                parts.append(f"{k}={v}")
+            print(" ".join(parts), flush=True)
+        except Exception:
+            logger.exception("[FullyAsyncRollouter][MemTrace][%s] failed to log marker", stage)
+
+    def _log_tracemalloc_top(self) -> None:
+        """Log the top-N Python allocation sites by current size.
+
+        A growing line here (same file:line climbing across monitor ticks) is
+        the smoking gun for a true Python-object leak inside the rollouter.
+        """
+        try:
+            snapshot = tracemalloc.take_snapshot()
+            top = snapshot.statistics("lineno")[:MEM_TRACE_TRACEMALLOC_TOPN]
+            lines = [
+                f"#{i + 1} {stat.size / (1024**2):.1f}MB count={stat.count} {stat.traceback.format()[-1].strip()}"
+                for i, stat in enumerate(top)
+            ]
+            logger.info(
+                "[FullyAsyncRollouter][MemTrace][tracemalloc top%d]\n%s", MEM_TRACE_TRACEMALLOC_TOPN, "\n".join(lines)
+            )
+        except Exception:
+            logger.exception("[FullyAsyncRollouter][MemTrace] tracemalloc snapshot failed")
+
     async def _async_monitor_loop(self):
         """
         Async coroutine for monitoring:
@@ -1044,6 +1256,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             if current_time - last_stats_time >= stats_interval:
                 stats = await self.get_statistics()
                 logger.info("[FullyAsyncRollouter][MonitorLoop][Statistics] %s", pformat(stats))
+                self._log_mem("monitor_tick")
+                if MEM_TRACE_ENABLED and MEM_TRACE_TRACEMALLOC_TOPN > 0 and tracemalloc.is_tracing():
+                    self._log_tracemalloc_top()
                 last_stats_time = current_time
 
             # Trigger rollout recovery
@@ -1080,11 +1295,33 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
     async def get_statistics(self) -> dict:
         queue_stats = await self.message_queue_client.get_statistics()
-        rss_gb = psutil.Process(os.getpid()).memory_info().rss / (1024**3)
+        snap = _proc_mem_snapshot(self._mem_proc)
+        children_rss_gb, n_children = _children_rss_gb(self._mem_proc)
+        object_store_used_gb = _object_store_used_gb()
+        try:
+            vm = psutil.virtual_memory()
+            sys_used_gb = (vm.total - vm.available) / _GB
+            sys_total_gb = vm.total / _GB
+            sys_percent = vm.percent
+        except Exception:
+            sys_used_gb = sys_total_gb = sys_percent = -1.0
 
         stats = {
+            # monitor: this-actor process memory split
+            "monitor/rollouter_rss_gb": snap["rss_gb"],
+            "monitor/rollouter_uss_gb": snap["uss_gb"],  # private heap; rising USS == in-process leak
+            "monitor/rollouter_shared_gb": snap["shared_gb"],  # object-store / shared-lib mmaps
+            "monitor/rollouter_peak_full_batch_mb": self._mem_peak_full_batch_mb,
+            # monitor: node + ray object store memory
+            "monitor/mem/children_rss_gb": children_rss_gb,
+            "monitor/mem/n_children": n_children,
+            "monitor/mem/object_store_used_gb": object_store_used_gb,
+            "monitor/mem/system_used_gb": sys_used_gb,
+            "monitor/mem/system_total_gb": sys_total_gb,
+            "monitor/mem/system_percent": sys_percent,
+            "monitor/mem/cum_image_raw_mb": self._mem_cum_image_raw_mb,
+            "monitor/mem/cum_image_processed_mb": self._mem_cum_image_proc_mb,
             # monitor stats
-            "monitor/rollouter_rss_gb": rss_gb,
             "monitor/active_tasks_size": len(self.active_tasks),
             "monitor/postprocess_tasks_size": len(self.postprocess_tasks),
             "monitor/total_inflight_tasks_size": len(self.active_tasks) + len(self.postprocess_tasks),
