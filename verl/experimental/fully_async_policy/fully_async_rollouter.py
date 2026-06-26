@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pprint import pformat
 
 import numpy as np
+import psutil
 import ray
 import torch
 
@@ -820,7 +821,6 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             name=f"{rollout_sample.sample_id}_postprocess",
             task_set=self.postprocess_tasks,
         )
-        task.add_done_callback(self.postprocess_tasks.discard)
 
     def _attach_image_refs_for_sample(self, rollout_sample: RolloutSample) -> RolloutSample:
         if not self.image_refs_enabled:
@@ -1080,9 +1080,11 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
     async def get_statistics(self) -> dict:
         queue_stats = await self.message_queue_client.get_statistics()
+        rss_gb = psutil.Process(os.getpid()).memory_info().rss / (1024**3)
 
         stats = {
             # monitor stats
+            "monitor/rollouter_rss_gb": rss_gb,
             "monitor/active_tasks_size": len(self.active_tasks),
             "monitor/postprocess_tasks_size": len(self.postprocess_tasks),
             "monitor/total_inflight_tasks_size": len(self.active_tasks) + len(self.postprocess_tasks),

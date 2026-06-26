@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import asyncio
+import ctypes
+import gc
 import logging
 import os
 import time
@@ -646,6 +648,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         if weights_updated:
             self._fit_log_aggregated_training_metrics()
         self._fit_postprocess_step()
+        batch = None
+        self._fit_cleanup_step_memory()
 
     async def _fit_generate(self, batch: DataProto = None) -> DataProto | None:
         metrics = self.metrics
@@ -1141,6 +1145,26 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         if self.local_trigger_step == 1:
             self.progress_bar.update(1)
+
+    def _fit_cleanup_step_memory(self):
+        """Drop trainer-side transient references after a step.
+
+        Large multi-turn GUI batches create many CPU tensors and object arrays
+        during expansion. Releasing Python references is not always enough to
+        lower process RSS because libc may keep freed arenas. ``malloc_trim`` is
+        Linux/glibc-specific, so keep it best-effort and env-controlled.
+        """
+        self.future_reward = None
+        self.reward_tensor = None
+        self.reward_extra_infos_dict = {}
+        collected = gc.collect()
+        trim_enabled = str(os.getenv("VERL_FULLY_ASYNC_MALLOC_TRIM", "1")).lower() not in {"0", "false", "no"}
+        if trim_enabled:
+            try:
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                logger.debug("[FullyAsyncTrainer] malloc_trim failed", exc_info=True)
+        logger.info("[FullyAsyncTrainer] cleanup_step_memory gc_collected=%d malloc_trim=%s", collected, trim_enabled)
 
     def _save_checkpoint(self):
         # Warning: Currently, to align the training process and metrics of colocate,

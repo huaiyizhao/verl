@@ -548,4 +548,5 @@ def safe_create_task(coro, name: str, task_set: set = None):
     task.add_done_callback(task_exception_handler)
     if task_set is not None:
         task_set.add(task)
+        task.add_done_callback(task_set.discard)
     return task

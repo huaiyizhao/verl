@@ -68,13 +68,15 @@ class MessageQueue:
             bool: Whether the sample was successfully put into the queue
         """
         async with self._lock:
-            # If queue is full, remove the oldest sample (rarely happens)
-            is_drop = False
+            # If queue is full, remove the oldest sample (rarely happens).
+            # The new sample is still enqueued, so return True below. Rollouter
+            # uses False to mean "the submitted sample was rejected" and will
+            # decrement staleness for that sample; returning False after
+            # replacing an old entry under-counts in-flight samples.
             if len(self.queue) >= self.max_queue_size:
                 self.queue.popleft()
                 self.dropped_samples += 1
-                is_drop = True
-                logger.warning("Queue full, dropped sample")
+                logger.warning("Queue full, dropped oldest sample")
             self.queue.append(sample)
             self.total_produced += 1
 
@@ -83,8 +85,6 @@ class MessageQueue:
 
             if self.total_produced % 100 == 0:
                 print(f"MessageQueue stats: produced={self.total_produced}, queue_size={len(self.queue)}")
-            if is_drop:
-                return False
             return True
 
     async def get_sample(self) -> Any | None:
