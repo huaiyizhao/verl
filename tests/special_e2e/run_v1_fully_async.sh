@@ -22,9 +22,10 @@ NUM_GPUS=${NUM_GPUS:-2}
 N_GPUS_TRAINING=${N_GPUS_TRAINING:-$((NUM_GPUS / 2))}
 N_GPUS_ROLLOUT=${N_GPUS_ROLLOUT:-$((NUM_GPUS - N_GPUS_TRAINING))}
 
-MODEL_PATH=${MODEL_PATH:-${HOME}/models/Qwen/Qwen2.5-0.5B-Instruct}
-TRAIN_FILES=${TRAIN_FILES:-${HOME}/data/gsm8k/train.parquet}
-VAL_FILES=${VAL_FILES:-${HOME}/data/gsm8k/test.parquet}
+# Defaults point at the shared /efs mount (visible on all cluster nodes). Override via env.
+MODEL_PATH=${MODEL_PATH:-/efs/data/rl/v1/models/Qwen/Qwen2.5-0.5B-Instruct}
+TRAIN_FILES=${TRAIN_FILES:-/efs/data/rl/v1/gsm8k/train.parquet}
+VAL_FILES=${VAL_FILES:-/efs/data/rl/v1/gsm8k/test.parquet}
 
 rollout_name=${ROLLOUT_NAME:-vllm}
 
