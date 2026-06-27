@@ -90,8 +90,8 @@ class ReplayBuffer:
         assert isinstance(self.max_off_policy_threshold, int) and self.max_off_policy_threshold > 0, (
             f"Invalid max off policy threshold: {self.max_off_policy_threshold}, must be an integer greater than 0"
         )
-        assert self.max_off_policy_strategy in ["drop", "wait"], (
-            f"Invalid max off policy strategy: {self.max_off_policy_strategy}, must be one of ['drop', 'wait']"
+        assert self.max_off_policy_strategy in ["drop", "wait", "none"], (
+            f"Invalid max off policy strategy: {self.max_off_policy_strategy}, must be one of ['drop', 'wait', 'none']"
         )
 
         # partition_id => {key: tag}
@@ -163,75 +163,49 @@ class ReplayBuffer:
         }
 
     def _has_enough_samples(self, global_steps: int, partition_id: str, batch_size: int) -> bool:
+        # "none" applies no staleness gate: just wait for batch_size finished prompts and sample
+        # the oldest (streaming bounds staleness via the feeder budget; TIS corrects off-policyness).
         # For wait strategy, we need to wait all trajectories that reach threshold to finish
         if self.max_off_policy_strategy == "wait":
             for key in self.pending_keys[partition_id] | self.running_keys[partition_id]:
                 prompt_global_steps = self.prompt_global_steps[partition_id][key]
                 if (global_steps - prompt_global_steps + 1) / self.parameter_sync_step >= self.max_off_policy_threshold:
                     return False
-            return len(self.finished_keys[partition_id]) + len(self.failure_keys[partition_id]) >= batch_size
 
-        # For drop strategy, only fresh (within-threshold) ready prompts count toward the batch:
-        # stale ones are evicted before selection, so we must wait for the feeder to produce
-        # enough fresh prompts rather than proceed with a batch that would drop to empty/short.
-        return len(self._fresh_ready_uids(global_steps, partition_id)) >= batch_size
+        return len(self.finished_keys[partition_id]) + len(self.failure_keys[partition_id]) >= batch_size
 
-    def _fresh_ready_uids(self, global_steps: int, partition_id: str) -> list[str]:
-        """Ready (finished/failure) prompt uids whose staleness is within the off-policy
-        threshold, sorted oldest-first (smallest global_steps first)."""
-        pgs = self.prompt_global_steps[partition_id]
-        ready = self.finished_keys[partition_id] | self.failure_keys[partition_id]
-        fresh = [
-            uid
-            for uid in ready
-            if (global_steps - pgs.get(uid, global_steps) + 1) / self.parameter_sync_step
-            <= self.max_off_policy_threshold
-        ]
-        return sorted(fresh, key=lambda uid: pgs.get(uid, 0))
+    def _drop_max_off_policy_samples(
+        self, global_steps: int, partition_id: str, batch: KVBatchMeta
+    ) -> tuple[KVBatchMeta, dict]:
+        if not self.max_off_policy_strategy == "drop":
+            return batch, {}
 
-    def _evict_stale_prompts(self, global_steps: int, partition_id: str) -> dict:
-        """Evict ready prompts whose staleness exceeds the threshold (drop strategy only).
+        kept_keys, kept_tags = [], []
+        dropped_keys, dropped_tags = [], []
+        for key, tag in zip(batch.keys, batch.tags, strict=False):
+            prompt_global_steps = tag["global_steps"]
+            if (global_steps - prompt_global_steps + 1) / self.parameter_sync_step > self.max_off_policy_threshold:
+                dropped_keys.append(key)
+                dropped_tags.append(tag)
+            else:
+                kept_keys.append(key)
+                kept_tags.append(tag)
 
-        Eviction runs BEFORE batch selection (and on every poll while waiting for enough fresh
-        samples) so that:
-          1. a backlog of stale prompts produced by the streaming feeder can never make the
-             selected batch empty/short (the previous select-then-drop order could), and
-          2. their in-flight budget slots free up so the feeder keeps producing fresh prompts.
+        # Remove dropped keys from TransferQueue
+        metrics = {}
+        if len(dropped_keys) > 0:
+            # TODO: should we drop the entire GRPO group if any of its sessions exceeds the threshold?
+            tq.kv_clear(partition_id=batch.partition_id, keys=dropped_keys)
+            logger.warning(f"Dropped {len(dropped_keys)} max off policy samples from partition {batch.partition_id}")
+            dropped_global_steps = np.array([tag["global_steps"] for tag in dropped_tags])
+            trajectory_staleness = (global_steps - dropped_global_steps + 1) / self.parameter_sync_step
+            prefix = "training" if partition_id == "train" else "validation"
+            metrics[f"{prefix}/off_policy/dropped_samples"] = len(dropped_keys)
+            metrics[f"{prefix}/off_policy/dropped_samples_staleness/mean"] = trajectory_staleness.mean()
+            metrics[f"{prefix}/off_policy/dropped_samples_staleness/max"] = trajectory_staleness.max()
+            metrics[f"{prefix}/off_policy/dropped_samples_staleness/min"] = trajectory_staleness.min()
 
-        Returns drop metrics (empty dict when nothing was evicted).
-        """
-        if self.max_off_policy_strategy != "drop":
-            return {}
-
-        pgs = self.prompt_global_steps[partition_id]
-        ready = self.finished_keys[partition_id] | self.failure_keys[partition_id]
-        stale_uids = [
-            uid
-            for uid in ready
-            if (global_steps - pgs.get(uid, global_steps) + 1) / self.parameter_sync_step
-            > self.max_off_policy_threshold
-        ]
-        if not stale_uids:
-            return {}
-
-        # Clear both the prompt keys and their trajectory keys ({uid}_{session}_{index}).
-        # TODO: should we drop the entire GRPO group if any of its sessions exceeds the threshold?
-        stale_set = set(stale_uids)
-        traj_keys = [k for k in self.partitions[partition_id] if k.split("_")[0] in stale_set]
-        tq.kv_clear(partition_id=partition_id, keys=list(stale_uids) + traj_keys)
-        self.finished_keys[partition_id].difference_update(stale_set)
-        self.failure_keys[partition_id].difference_update(stale_set)
-
-        logger.warning(f"Dropped {len(stale_uids)} max off policy prompts from partition {partition_id}")
-        dropped_global_steps = np.array([pgs[uid] for uid in stale_uids])
-        trajectory_staleness = (global_steps - dropped_global_steps + 1) / self.parameter_sync_step
-        prefix = "training" if partition_id == "train" else "validation"
-        return {
-            f"{prefix}/off_policy/dropped_samples": len(stale_uids),
-            f"{prefix}/off_policy/dropped_samples_staleness/mean": trajectory_staleness.mean(),
-            f"{prefix}/off_policy/dropped_samples_staleness/max": trajectory_staleness.max(),
-            f"{prefix}/off_policy/dropped_samples_staleness/min": trajectory_staleness.min(),
-        }
+        return KVBatchMeta(partition_id=batch.partition_id, keys=kept_keys, tags=kept_tags), metrics
 
     def sample(self, global_steps: int, partition_id: str, batch_size: int) -> KVBatchMeta:
         """Sample a batch of data from the replay buffer.
@@ -253,13 +227,9 @@ class ReplayBuffer:
         """
         last_debug_time = time.time()
         self._sync_metadata_from_transfer_queue()
-        # Evict over-threshold prompts before checking/selecting so a stale backlog can never
-        # yield an empty batch and so the feeder's budget frees up for fresh prompts.
-        drop_metrics = self._evict_stale_prompts(global_steps, partition_id)
         while not self._has_enough_samples(global_steps, partition_id, batch_size):
             time.sleep(self.poll_interval)
             self._sync_metadata_from_transfer_queue()
-            self._accumulate_drop_metrics(drop_metrics, self._evict_stale_prompts(global_steps, partition_id))
 
             if time.time() - last_debug_time > VERL_REPLAY_BUFFER_DEBUG_INTERVAL_SECONDS:
                 logger.info(
@@ -271,8 +241,12 @@ class ReplayBuffer:
                 last_debug_time = time.time()
 
         # TODO: should we filter out samples with some of their sessions failed?
-        # Prioritize sampling the oldest fresh prompts (smallest global_steps first) to reduce staleness.
-        selected_prompt_uids = self._fresh_ready_uids(global_steps, partition_id)[:batch_size]
+        finished_keys = self.finished_keys[partition_id]
+        failure_keys = self.failure_keys[partition_id]
+        # Prioritize sampling the oldest prompts (smallest global_steps first) to reduce staleness.
+        prompt_global_steps = self.prompt_global_steps[partition_id]
+        sampleable_keys = sorted(finished_keys.union(failure_keys), key=lambda key: prompt_global_steps.get(key, 0))
+        selected_prompt_uids = sampleable_keys[:batch_size]
         tq.kv_clear(partition_id=partition_id, keys=selected_prompt_uids)
 
         keys, tags = [], []
@@ -284,13 +258,4 @@ class ReplayBuffer:
                 tags.append(tag)
 
         batch = KVBatchMeta(partition_id=partition_id, keys=keys, tags=tags)
-        return batch, drop_metrics
-
-    @staticmethod
-    def _accumulate_drop_metrics(acc: dict, new: dict) -> None:
-        """Merge per-poll eviction metrics: sum dropped counts, keep the latest staleness stats."""
-        for k, v in new.items():
-            if k.endswith("dropped_samples"):
-                acc[k] = acc.get(k, 0) + v
-            else:
-                acc[k] = v
+        return self._drop_max_off_policy_samples(global_steps, partition_id, batch)

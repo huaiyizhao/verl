@@ -45,9 +45,11 @@ parameter_sync_step=${PARAMETER_SYNC_STEP:-4}
 staleness_threshold=${STALENESS_THRESHOLD:-1}
 # Streaming relies on the feeder's in-flight budget to BOUND staleness, and on truncated
 # importance sampling (TIS, calculate_log_probs=True) to CORRECT the residual off-policyness —
-# not on the replay buffer hard-dropping samples. So the buffer drop threshold defaults high
-# enough that it never bites; lower MAX_OFF_POLICY_THRESHOLD only to exercise the drop path.
-max_off_policy_threshold=${MAX_OFF_POLICY_THRESHOLD:-1000000}
+# NOT on the replay buffer hard-dropping samples. So the trainer-side staleness gate is off by
+# default (strategy "none"). Set MAX_OFF_POLICY_STRATEGY=drop (+ a small MAX_OFF_POLICY_THRESHOLD)
+# only to exercise the hard-drop path.
+max_off_policy_strategy=${MAX_OFF_POLICY_STRATEGY:-none}
+max_off_policy_threshold=${MAX_OFF_POLICY_THRESHOLD:-$((staleness_threshold + 1))}
 
 total_training_steps=${TOTAL_TRAINING_STEPS:-20}
 
@@ -76,7 +78,7 @@ ray job submit \
     trainer.v1.fully_async.parameter_sync_step=${parameter_sync_step} \
     trainer.v1.fully_async.staleness_threshold=${staleness_threshold} \
     trainer.v1.fully_async.feeder_poll_interval=1.0 \
-    trainer.v1.sampler.max_off_policy_strategy=drop \
+    trainer.v1.sampler.max_off_policy_strategy=${max_off_policy_strategy} \
     trainer.v1.sampler.max_off_policy_threshold=${max_off_policy_threshold} \
     transfer_queue.enable=True \
     data.train_files="${TRAIN_FILES}" \

@@ -256,6 +256,8 @@ trainer:
       # How to handle trajectory that exceeds the maximum number of model versions
       # drop: drop the trajectory
       # wait: dropless, wait all trajectories that reach threshold to finish
+      # none: no staleness gate — sample the oldest ready prompts and rely on rollout importance
+      #       sampling (TIS) to correct off-policyness (used by streaming / fully_async)
       max_off_policy_strategy: drop
 
       # Custom sampler config
