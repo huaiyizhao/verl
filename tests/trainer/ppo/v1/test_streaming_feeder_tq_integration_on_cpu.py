@@ -320,6 +320,52 @@ def test_feeder_pause_blocks_dispatch_against_real_tq():
     assert counts["pending"] == n_after_resume, counts
 
 
+# ======================================================================================
+# I5: regression — a stale backlog must not yield an empty/short batch (drop strategy)
+# ======================================================================================
+def test_sample_evicts_stale_backlog_and_returns_full_fresh_batch():
+    """Regression for the streaming empty-batch crash.
+
+    Before the fix, sample() picked the oldest batch_size prompts and THEN dropped the
+    over-threshold ones, so a backlog of stale prompts (which sort oldest-first) produced an
+    empty batch and crashed _balance_batch (number of items:[0] < k_partitions). Now stale
+    prompts are evicted BEFORE selection, so sample() returns a full batch of fresh prompts.
+
+    Note: uids must not contain '_' because sample() matches trajectories via key.split('_')[0].
+    """
+    rb = _make_replay_buffer(strategy="drop", threshold=2, parameter_sync_step=1)
+    global_steps = 10
+
+    # Stale backlog: prompt_gs=1 -> staleness = (10 - 1 + 1) / 1 = 10 > 2 -> must be evicted.
+    stale_uids = []
+    for i in range(5):
+        uid = f"stale{i}"
+        _register_trajectory(uid, 1)
+        _register_prompt(uid, "finished", 1)
+        stale_uids.append(uid)
+
+    # Fresh prompts: prompt_gs in {9, 10} -> staleness <= 2 -> kept.
+    fresh_uids = []
+    for i, gs in enumerate((9, 9, 10)):
+        uid = f"fresh{i}"
+        _register_trajectory(uid, gs)
+        _register_prompt(uid, "finished", gs)
+        fresh_uids.append(uid)
+
+    batch, metrics = rb.sample(global_steps=global_steps, partition_id="train", batch_size=2)
+
+    # Non-empty, exactly batch_size, and every selected trajectory belongs to a fresh prompt.
+    assert batch.keys, "sample() returned an empty batch despite fresh prompts being available"
+    selected = {k.split("_")[0] for k in batch.keys}
+    assert selected.issubset(set(fresh_uids)), f"selected non-fresh prompts: {selected}"
+    assert len(selected) == 2, f"expected 2 fresh prompts, got {selected}"
+
+    # The whole stale backlog was evicted from TQ and reported in the drop metrics.
+    counts = rb.count_inflight("train")
+    assert counts["finished"] == 1, counts  # 3 fresh - 2 selected = 1 still finished
+    assert metrics.get("training/off_policy/dropped_samples", 0) == 5, metrics
+
+
 def _run_all():
     setup_module(None)
     try:
