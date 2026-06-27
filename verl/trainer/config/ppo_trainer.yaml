@@ -232,8 +232,10 @@ trainer:
     # trainer step only samples + trains. Builds on separate_async (standalone rollout).
     fully_async:
 
-      # Number of warmup batches to feed before the autonomous feeder starts
-      num_warmup_batches: 4
+      # Number of warmup batches to feed before the autonomous feeder starts. Default 0: under
+      # streaming the feeder is the sole producer and fills the pipeline itself, so warmup is
+      # redundant and only injects a stale gs~0 backlog that ages past the staleness budget.
+      num_warmup_batches: 0
 
       # Frequency (in training steps) of parameter synchronization between trainer and rollout
       parameter_sync_step: 4

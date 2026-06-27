@@ -43,9 +43,11 @@ max_response_length=${MAX_RESPONSE_LENGTH:-512}
 # Streaming / off-policy knobs.
 parameter_sync_step=${PARAMETER_SYNC_STEP:-4}
 staleness_threshold=${STALENESS_THRESHOLD:-1}
-# Buffer drop threshold should be >= staleness_threshold + 1 so it doesn't drop samples the
-# feeder was allowed to produce.
-max_off_policy_threshold=${MAX_OFF_POLICY_THRESHOLD:-$((staleness_threshold + 1))}
+# Streaming relies on the feeder's in-flight budget to BOUND staleness, and on truncated
+# importance sampling (TIS, calculate_log_probs=True) to CORRECT the residual off-policyness —
+# not on the replay buffer hard-dropping samples. So the buffer drop threshold defaults high
+# enough that it never bites; lower MAX_OFF_POLICY_THRESHOLD only to exercise the drop path.
+max_off_policy_threshold=${MAX_OFF_POLICY_THRESHOLD:-1000000}
 
 total_training_steps=${TOTAL_TRAINING_STEPS:-20}
 
@@ -54,10 +56,23 @@ exp_name="$(basename "${MODEL_PATH,,}")-v1-fully-async-streaming"
 echo "Running V1 fully_async (streaming) trainer"
 echo "Training GPUs: ${N_GPUS_TRAINING} | Standalone rollout GPUs: ${N_GPUS_ROLLOUT}"
 
-python3 -m verl.trainer.main_ppo \
+# Submit as a Ray job so the head node's working_dir (this checkout) is shipped to ALL nodes
+# for this run and prepended to sys.path — edit code only on the head, no `git pull` on every
+# worker. Override RAY_DASHBOARD / VERL_HOME if your layout differs.
+RAY_DASHBOARD=${RAY_DASHBOARD:-http://127.0.0.1:8265}
+VERL_HOME=${VERL_HOME:-${HOME}/verl}
+runtime_env_json=$(cat <<JSON
+{"working_dir": "${VERL_HOME}", "excludes": [".git", "data", "*.parquet", "*.whl", "*.pt", "*.safetensors", "__pycache__"], "env_vars": {"VERL_LOGGING_LEVEL": "${VERL_LOGGING_LEVEL:-INFO}", "VLLM_USE_V1": "1"}}
+JSON
+)
+
+ray job submit \
+    --address "${RAY_DASHBOARD}" \
+    --runtime-env-json "${runtime_env_json}" \
+    -- python3 -m verl.trainer.main_ppo \
     trainer.use_v1=True \
     trainer.v1.trainer_mode=fully_async \
-    trainer.v1.fully_async.num_warmup_batches=4 \
+    trainer.v1.fully_async.num_warmup_batches=0 \
     trainer.v1.fully_async.parameter_sync_step=${parameter_sync_step} \
     trainer.v1.fully_async.staleness_threshold=${staleness_threshold} \
     trainer.v1.fully_async.feeder_poll_interval=1.0 \
