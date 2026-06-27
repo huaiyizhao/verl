@@ -70,7 +70,9 @@ class PPOTrainerFullyAsync(PPOTrainerSeparateAsync):
             poll_interval=self.config.trainer.v1.fully_async.feeder_poll_interval,
         )
         self._feeder.start()
-        logger.info("Streaming rollout feeder started; budget=%d prompts", budget)
+        # print (not logger.info): verl configures no logging handler, so INFO is swallowed in
+        # the trainer actor. These lifecycle markers must reach stdout to be observable/asserted.
+        print(f"Streaming rollout feeder started; budget={budget} prompts", flush=True)
 
     def step(self, metrics, timing_raw):
         # fail fast instead of hanging in replay_buffer.sample if the feeder died
@@ -85,14 +87,14 @@ class PPOTrainerFullyAsync(PPOTrainerSeparateAsync):
         # independent of this pause.
         is_sync_step = self._feeder is not None and self.global_steps % self.parameter_sync_step == 0
         if is_sync_step:
-            logger.info("Pausing streaming feeder for weight sync at step %d", self.global_steps)
+            print(f"Pausing streaming feeder for weight sync at step {self.global_steps}", flush=True)
             self._feeder.pause()
         try:
             super().on_step_end()  # separate_async: standalone update_weights on sync steps
         finally:
             if is_sync_step:
                 self._feeder.resume()
-                logger.info("Resumed streaming feeder after weight sync at step %d", self.global_steps)
+                print(f"Resumed streaming feeder after weight sync at step {self.global_steps}", flush=True)
         with self._param_version_lock:
             self._param_version = self.global_steps
 
