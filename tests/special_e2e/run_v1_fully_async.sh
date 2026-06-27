@@ -64,7 +64,7 @@ echo "Training GPUs: ${N_GPUS_TRAINING} | Standalone rollout GPUs: ${N_GPUS_ROLL
 RAY_DASHBOARD=${RAY_DASHBOARD:-http://127.0.0.1:8265}
 VERL_HOME=${VERL_HOME:-${HOME}/verl}
 runtime_env_json=$(cat <<JSON
-{"working_dir": "${VERL_HOME}", "excludes": [".git", "data", "*.parquet", "*.whl", "*.pt", "*.safetensors", "__pycache__"], "env_vars": {"VERL_LOGGING_LEVEL": "${VERL_LOGGING_LEVEL:-INFO}", "VLLM_USE_V1": "1"}}
+{"working_dir": "${VERL_HOME}", "excludes": ["/.git", "/data", "*.parquet", "*.whl", "*.pt", "*.safetensors", "__pycache__"], "env_vars": {"VERL_LOGGING_LEVEL": "${VERL_LOGGING_LEVEL:-INFO}", "VLLM_USE_V1": "1"}}
 JSON
 )
 
