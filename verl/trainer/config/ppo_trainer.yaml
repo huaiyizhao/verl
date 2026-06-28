@@ -247,9 +247,13 @@ trainer:
       # Seconds the feeder sleeps when the in-flight budget is full (avoids busy-waiting)
       feeder_poll_interval: 1.0
 
-      # Per-worker cap on concurrently-executing rollouts (event-loop / GIL pressure knob).
-      # Rollouts are dispatched one session at a time across the worker pool; this bounds how
-      # many run at once inside a single AgentLoopWorker process. 0 = unbounded (legacy behavior).
+      # Opt-in: dispatch generation at rollout (single GRPO session) granularity across the
+      # worker pool, decoupling a prompt from any single worker (a long-tail rollout no longer
+      # blocks its siblings). false = legacy prompt-pinned chunk dispatch (fully backward compatible).
+      rollout_level_dispatch: false
+
+      # Per-worker cap on concurrently-executing rollouts (event-loop / GIL pressure knob); only
+      # applies when rollout_level_dispatch=true. 0 = unbounded.
       max_concurrent_rollouts_per_worker: 0
 
       # Store multimodal pixel tensors (pixel_values) as bf16 in TransferQueue to ~halve their

@@ -96,10 +96,14 @@ def _clean_tq():
     _clear_all()
 
 
-def _make_replay_buffer(strategy="drop", threshold=8, parameter_sync_step=1):
+def _make_replay_buffer(strategy="drop", threshold=8, parameter_sync_step=1, session_counting=True):
+    # session_counting=True selects the rollout-level (session-counting) readiness; False selects
+    # the legacy prompt-status readiness. The flag is read from trainer_config.rollout_level_dispatch.
     return ReplayBuffer(
         trainer_mode="fully_async",
-        trainer_config=OmegaConf.create({"parameter_sync_step": parameter_sync_step}),
+        trainer_config=OmegaConf.create(
+            {"parameter_sync_step": parameter_sync_step, "rollout_level_dispatch": session_counting}
+        ),
         max_off_policy_threshold=threshold,
         max_off_policy_strategy=strategy,
         sampler_kwargs=OmegaConf.create({}),
@@ -409,6 +413,54 @@ def test_strategy_none_no_staleness_gate():
     # buffer reports no drops.
     assert len(selected) == 4, selected
     assert {"old0", "old1", "old2"}.issubset(selected), selected
+    assert metrics == {}, metrics
+
+
+# ======================================================================================
+# L1/L2: legacy prompt-status readiness (session_counting=False) — backward compatibility
+# ======================================================================================
+def _register_prompt_legacy(uid, status, global_steps, partition_id="train"):
+    """Mirror the legacy trainer_base._feed_one_batch / _run_prompt prompt-status tag."""
+    tq.kv_batch_put(
+        keys=[uid],
+        partition_id=partition_id,
+        tags=[{"is_prompt": True, "status": status, "global_steps": global_steps}],
+    )
+
+
+def _register_trajectory_legacy(uid, global_steps, partition_id="train"):
+    """Legacy data key (no session marker), as the legacy worker postprocess would write."""
+    tq.kv_batch_put(
+        keys=[f"{uid}_0_0"],
+        partition_id=partition_id,
+        tags=[{"global_steps": global_steps, "seq_len": 8, "status": "success"}],
+    )
+
+
+def test_legacy_count_inflight_status_buckets():
+    rb = _make_replay_buffer(session_counting=False)
+    _register_prompt_legacy("p_pending", "pending", 1)
+    _register_prompt_legacy("p_running", "running", 1)
+    _register_prompt_legacy("p_fin1", "finished", 1)
+    _register_prompt_legacy("p_fin2", "finished", 1)
+    _register_prompt_legacy("p_fail", "failure", 1)
+    counts = rb.count_inflight("train")
+    assert counts == {"pending": 1, "running": 1, "finished": 2, "failure": 1}, counts
+
+
+def test_legacy_sample_selects_finished_oldest():
+    rb = _make_replay_buffer(strategy="none", session_counting=False)
+    for i in range(3):
+        uid = f"old{i}"
+        _register_trajectory_legacy(uid, 1)
+        _register_prompt_legacy(uid, "finished", 1)
+    for i in range(2):
+        uid = f"new{i}"
+        _register_trajectory_legacy(uid, 10)
+        _register_prompt_legacy(uid, "finished", 10)
+    batch, metrics = rb.sample(global_steps=10, partition_id="train", batch_size=3)
+    selected = {k.split("_")[0] for k in batch.keys}
+    assert selected == {"old0", "old1", "old2"}, selected  # oldest-first, finished prompts
     assert metrics == {}, metrics
 
 

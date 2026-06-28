@@ -23,15 +23,21 @@ from typing import Any
 import ray
 import torch
 import transfer_queue as tq
+from omegaconf import OmegaConf
 from tensordict import NonTensorData, NonTensorStack, TensorDict
 
 from verl.experimental.agent_loop import (
     AgentLoopManager,
     AgentLoopOutput,
     AgentLoopWorker,
+    get_trajectory_info,
 )
 from verl.utils.ray_utils import auto_await
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
+
+# Config flag (default off) selecting rollout-level dispatch. When False the legacy
+# prompt-pinned chunk dispatch + prompt-status readiness are used, byte-for-byte as before.
+ROLLOUT_LEVEL_DISPATCH_KEY = "trainer.v1.fully_async.rollout_level_dispatch"
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -161,6 +167,84 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
             },
         )
 
+    # ---- Legacy prompt-pinned path (used when rollout_level_dispatch=False) ----
+    async def generate_sequences(self, batch: TensorDict) -> None:
+        """Legacy: spawn agent loop for each sample in the batch without waiting for the results."""
+        validate = batch["validate"] if "validate" in batch else False
+        batch.pop("validate", None)
+        config = self.config.actor_rollout_ref.rollout
+        sampling_params = dict(
+            temperature=config.temperature,
+            top_p=config.top_p,
+            top_k=config.top_k,
+            repetition_penalty=1.0,
+            logprobs=config.calculate_log_probs,
+        )
+
+        # override sampling params for validation
+        if validate:
+            sampling_params["top_p"] = config.val_kwargs.top_p
+            sampling_params["top_k"] = config.val_kwargs.top_k
+            sampling_params["temperature"] = config.val_kwargs.temperature
+
+        # by default, we assume it's a single turn agent
+        if "agent_name" not in batch:
+            default_agent_loop = config.agent.default_agent_loop
+            batch["agent_name"] = NonTensorData(default_agent_loop)
+
+        trajectory_info = await get_trajectory_info(batch["global_steps"], batch["index"], validate)
+
+        # create background tasks for each sample in the batch
+        for i in range(len(batch)):
+            # TODO(wuxibin): add trace support
+            trace_this_sample = False
+            prompt = {}
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    prompt[k] = v[i]
+                elif isinstance(v, NonTensorStack):
+                    prompt[k] = v[i].data
+                elif isinstance(v, NonTensorData):
+                    prompt[k] = v.data
+                else:
+                    logger.exception(f"Unsupported type {type(v)} for key {k}")
+
+            # “fire-and-forget” background tasks
+            task = asyncio.create_task(
+                self._run_prompt(prompt, sampling_params, trajectory=trajectory_info[i], trace=trace_this_sample)
+            )
+            self.background_tasks.add(task)
+            task.add_done_callback(self.background_tasks.discard)
+
+    async def _run_prompt(self, prompt: dict, sampling_params: dict, trajectory: dict, trace: bool = False) -> None:
+        """Legacy: spawn multiple agent loops in parallel according to rollout.n / val_kwargs.n,
+        and track GRPO-group status via the prompt-status tag (running -> finished/failure)."""
+        uid, partition_id = prompt["uid"], "train" if not trajectory["validate"] else "val"
+        await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "running"})
+        try:
+            # NOTE: user can dynamically adjust n for each sample here, e.g according to task difficulty.
+            config = self.config.actor_rollout_ref.rollout
+            n = prompt.pop("__rollout_n__", config.n if not trajectory["validate"] else config.val_kwargs.n)
+            do_sample = prompt.pop("__do_sample__", True)
+
+            run_sampling_params = dict(sampling_params)
+            if not trajectory["validate"] and not do_sample:
+                apply_greedy_sampling_params(run_sampling_params)
+
+            tasks = []
+            for i in range(n):
+                task = asyncio.create_task(
+                    self._run_agent_loop(
+                        run_sampling_params, trajectory=trajectory, trace=trace, session_id=i, **prompt
+                    )
+                )
+                tasks.append(task)
+            await asyncio.gather(*tasks)
+            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "finished"})
+        except Exception as e:
+            logger.exception(f"Error in _run_prompt: {e}")
+            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "failure"})
+
     async def _agent_loop_postprocess(
         self, output: AgentLoopOutput | list[AgentLoopOutput], validate, **kwargs
     ) -> None:
@@ -248,6 +332,8 @@ class AgentLoopManagerTQ(AgentLoopManager):
         # Round-robin cursor for rollout-level dispatch; persists across batches so prompts
         # fed back-to-back keep spreading evenly across the worker pool.
         self._dispatch_rr = 0
+        # Opt-in: rollout-level dispatch. Default False keeps the legacy prompt-pinned chunk path.
+        self._rollout_level_dispatch = bool(OmegaConf.select(self.config, ROLLOUT_LEVEL_DISPATCH_KEY, default=False))
 
     @classmethod
     @auto_await
@@ -269,6 +355,18 @@ class AgentLoopManagerTQ(AgentLoopManager):
         Args:
             prompts (TensorDict): Input batch from train or validation dataset.
         """
+        if not self._rollout_level_dispatch:
+            # Legacy prompt-pinned path: chunk the batch across workers; each worker fans out a
+            # whole prompt's n sessions internally and tracks GRPO-group status tags.
+            chunkes = prompts.chunk(len(self.agent_loop_workers))
+            ray.get(
+                [
+                    worker.generate_sequences.remote(chunk)
+                    for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=False)
+                ]
+            )
+            return
+
         validate = bool(prompts["validate"]) if "validate" in prompts else False
         prompts.pop("validate", None)
         config = self.config.actor_rollout_ref.rollout

@@ -880,6 +880,7 @@ trainer:
       parameter_sync_step: 4
       staleness_threshold: 1
       feeder_poll_interval: 1.0
+      rollout_level_dispatch: false
       max_concurrent_rollouts_per_worker: 0
       multimodal_storage_bf16: false
     sampler:

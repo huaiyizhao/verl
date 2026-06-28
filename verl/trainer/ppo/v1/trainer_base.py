@@ -111,6 +111,11 @@ class PPOTrainer(ABC):
         # When True, an autonomous background feeder owns prompt generation and `step()`
         # must not feed a batch itself (set by the streaming `fully_async` trainer mode).
         self._feeder_owns_generation = False
+        # Opt-in rollout-level dispatch: prompt tags carry session count `n` (session-counting
+        # readiness) instead of a `status` (legacy prompt-status readiness). Default off.
+        self._rollout_level_dispatch = bool(
+            OmegaConf.select(self.config, "trainer.v1.fully_async.rollout_level_dispatch", default=False)
+        )
         # Serializes access to the (non-thread-safe) train dataloader iterator between the
         # main thread (checkpoint save) and the streaming feeder thread.
         self._dataloader_lock = threading.Lock()
@@ -776,8 +781,11 @@ class PPOTrainer(ABC):
             tu.assign_non_tensor_data(batch, "validate", True)
             # Register each prompt (GRPO group) in TransferQueue as a tag-only metadata marker.
             # global_steps drives staleness ordering; n is the session count for readiness.
-            n_sessions = int(self.config.actor_rollout_ref.rollout.val_kwargs.n)
-            tags = [{"is_prompt": True, "global_steps": self.global_steps, "n": n_sessions}] * len(batch)
+            if self._rollout_level_dispatch:
+                n_sessions = int(self.config.actor_rollout_ref.rollout.val_kwargs.n)
+                tags = [{"is_prompt": True, "global_steps": self.global_steps, "n": n_sessions}] * len(batch)
+            else:
+                tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps}] * len(batch)
             tq.kv_batch_put(keys=list(batch["uid"]), partition_id="val", tags=tags)
             self.agent_loop_manager.generate_sequences(batch)
 
@@ -1133,9 +1141,12 @@ class PPOTrainer(ABC):
         tu.assign_non_tensor_data(batch, "global_steps", global_steps)
 
         # Register each prompt (GRPO group) in TransferQueue as a tag-only metadata marker.
-        # n is the number of GRPO sessions; the prompt is sampleable once all n complete.
-        n_sessions = int(self.config.actor_rollout_ref.rollout.n)
-        tags = [{"is_prompt": True, "global_steps": global_steps, "n": n_sessions}] * len(batch)
+        if self._rollout_level_dispatch:
+            # n is the number of GRPO sessions; the prompt is sampleable once all n complete.
+            n_sessions = int(self.config.actor_rollout_ref.rollout.n)
+            tags = [{"is_prompt": True, "global_steps": global_steps, "n": n_sessions}] * len(batch)
+        else:
+            tags = [{"is_prompt": True, "status": "pending", "global_steps": global_steps}] * len(batch)
         tq.kv_batch_put(keys=list(batch["uid"]), partition_id="train", tags=tags)
 
         # add batch to agent loop manager
