@@ -881,6 +881,7 @@ trainer:
       staleness_threshold: 1
       feeder_poll_interval: 1.0
       max_concurrent_rollouts_per_worker: 0
+      multimodal_storage_bf16: false
     sampler:
       max_off_policy_threshold: 8
       max_off_policy_strategy: drop

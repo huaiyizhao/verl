@@ -252,6 +252,10 @@ trainer:
       # many run at once inside a single AgentLoopWorker process. 0 = unbounded (legacy behavior).
       max_concurrent_rollouts_per_worker: 0
 
+      # Store multimodal pixel tensors (pixel_values) as bf16 in TransferQueue to ~halve their
+      # RAM footprint in the storage-unit actors. The model consumes bf16 anyway. false = float32.
+      multimodal_storage_bf16: false
+
     # Replay buffer sampling strategy
     sampler:
 
