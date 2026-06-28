@@ -774,9 +774,10 @@ class PPOTrainer(ABC):
             batch = tu.get_tensordict(batch_dict)
             tu.assign_non_tensor_data(batch, "global_steps", self.global_steps)
             tu.assign_non_tensor_data(batch, "validate", True)
-            # Register each prompt (GRPO group) in TransferQueue as a tag-only status marker.
-            # global_steps is required by ReplayBuffer's metadata sync / staleness ordering.
-            tags = [{"is_prompt": True, "status": "pending", "global_steps": self.global_steps}] * len(batch)
+            # Register each prompt (GRPO group) in TransferQueue as a tag-only metadata marker.
+            # global_steps drives staleness ordering; n is the session count for readiness.
+            n_sessions = int(self.config.actor_rollout_ref.rollout.val_kwargs.n)
+            tags = [{"is_prompt": True, "global_steps": self.global_steps, "n": n_sessions}] * len(batch)
             tq.kv_batch_put(keys=list(batch["uid"]), partition_id="val", tags=tags)
             self.agent_loop_manager.generate_sequences(batch)
 
@@ -1131,8 +1132,10 @@ class PPOTrainer(ABC):
         batch = tu.get_tensordict(batch_dict)
         tu.assign_non_tensor_data(batch, "global_steps", global_steps)
 
-        # Register each prompt (GRPO group) in TransferQueue as a tag-only status marker
-        tags = [{"is_prompt": True, "status": "pending", "global_steps": global_steps}] * len(batch)
+        # Register each prompt (GRPO group) in TransferQueue as a tag-only metadata marker.
+        # n is the number of GRPO sessions; the prompt is sampleable once all n complete.
+        n_sessions = int(self.config.actor_rollout_ref.rollout.n)
+        tags = [{"is_prompt": True, "global_steps": global_steps, "n": n_sessions}] * len(batch)
         tq.kv_batch_put(keys=list(batch["uid"]), partition_id="train", tags=tags)
 
         # add batch to agent loop manager

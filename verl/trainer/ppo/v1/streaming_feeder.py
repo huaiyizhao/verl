@@ -60,8 +60,9 @@ class StreamingFeeder:
     exception (which sets :attr:`error` so the trainer can fail fast instead of hanging).
 
     Args:
-        count_inflight: Returns a dict with keys ``pending``/``running``/``finished``/
-            ``failure`` giving the current TransferQueue prompt counts.
+        count_inflight: Returns a dict of current un-consumed prompt counts (e.g.
+            ``incomplete``/``complete``). The feeder sums the values to get the in-flight total,
+            so the exact bucket names are not significant.
         feed_one_batch: Called as ``feed_one_batch(global_steps)`` to stream one batch of
             prompts, tagged with the given parameter version.
         param_version: Returns the current parameter version used to tag fed prompts.
@@ -96,7 +97,9 @@ class StreamingFeeder:
                 continue
             try:
                 counts = self._count_inflight()
-                inflight = counts["pending"] + counts["running"] + counts["finished"] + counts["failure"]
+                # Bucket names are an implementation detail of the replay buffer; the budget
+                # bounds the total un-consumed prompts regardless of how they are bucketed.
+                inflight = sum(counts.values())
                 if inflight < self._budget:
                     self._feed_one_batch(self._param_version())
                 else:

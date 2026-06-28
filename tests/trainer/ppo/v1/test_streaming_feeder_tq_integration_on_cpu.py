@@ -11,19 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU integration tests for the streaming rollout pipeline.
+"""CPU integration tests for the streaming rollout pipeline (rollout-level dispatch).
 
 These wire the *real* ``StreamingFeeder`` and the *real* ``ReplayBuffer`` against a *real*
 TransferQueue (SimpleStorage / ZMQ in-memory, no GPU) backed by a local Ray cluster. The only
 simulated pieces are the parts that inherently need a GPU rollout server:
 
-- the trainer-side ``_feed_one_batch`` glue (here: register a pending prompt + a running
-  trajectory key in TQ, exactly mirroring trainer_base._feed_one_batch's TQ writes), and
-- the agent-loop worker (here: a thread that flips prompts pending->finished after a delay).
+- the trainer-side ``_feed_one_batch`` glue (here: register a prompt metadata key in TQ,
+  mirroring trainer_base._feed_one_batch: ``{is_prompt, global_steps, n}``), and
+- the agent-loop worker (here: a thread that writes per-session completion markers +
+  trajectory data keys, mirroring AgentLoopWorkerTQ._execute_rollout).
 
-This validates the streaming throttle end to end: that the feeder bounds in-flight prompts to
-the budget against the real TQ counts read by ReplayBuffer.count_inflight, and that the full
-produce -> finish -> sample -> clear cycle reaches a bounded steady state without deadlock.
+Readiness is **session-counting**: a prompt becomes sampleable once all ``n`` of its sessions
+have written a completion marker (``success`` or ``failure``). This validates the streaming
+throttle end to end against the real TQ counts read by ReplayBuffer.count_inflight, and that the
+full produce -> complete -> sample -> clear cycle reaches a bounded steady state without deadlock.
 
 Run:  /cbs/cua/.venv/bin/python -m pytest \
           tests/trainer/ppo/v1/test_streaming_feeder_tq_integration_on_cpu.py -v
@@ -105,39 +107,99 @@ def _make_replay_buffer(strategy="drop", threshold=8, parameter_sync_step=1):
     )
 
 
-def _register_prompt(uid, status, global_steps, partition_id="train"):
-    """Mirror what trainer_base._feed_one_batch writes for the prompt status marker."""
+def _register_prompt(uid, global_steps, n=1, partition_id="train"):
+    """Mirror trainer_base._feed_one_batch's prompt metadata write (no status; carries n)."""
     tq.kv_batch_put(
         keys=[uid],
         partition_id=partition_id,
-        tags=[{"is_prompt": True, "status": status, "global_steps": global_steps}],
+        tags=[{"is_prompt": True, "global_steps": global_steps, "n": n}],
     )
 
 
-def _register_trajectory(uid, global_steps, partition_id="train"):
-    """Register one trajectory value key for a prompt (non-prompt tag), as a worker would."""
-    traj_key = f"{uid}_0_0"
+def _register_session(uid, session_id=0, status="success", global_steps=1, partition_id="train"):
+    """Mirror AgentLoopWorkerTQ completing one rollout: write the trajectory data key (success
+    only) then the per-session completion marker."""
+    if status == "success":
+        tq.kv_batch_put(
+            keys=[f"{uid}_{session_id}_0"],
+            partition_id=partition_id,
+            tags=[{"global_steps": global_steps, "seq_len": 8, "status": "success"}],
+        )
     tq.kv_batch_put(
-        keys=[traj_key],
+        keys=[f"{uid}_sess{session_id}"],
         partition_id=partition_id,
-        tags=[{"global_steps": global_steps, "seq_len": 8, "status": "finished"}],
+        tags=[{"is_session": True, "session_id": session_id, "status": status}],
     )
-    return traj_key
 
 
 # ======================================================================================
-# I1: ReplayBuffer.count_inflight reflects real TransferQueue state
+# I1: ReplayBuffer.count_inflight reflects real TransferQueue state (incomplete/complete)
 # ======================================================================================
 def test_count_inflight_reflects_real_tq():
     rb = _make_replay_buffer()
-    _register_prompt("p_pending", "pending", 1)
-    _register_prompt("p_running", "running", 1)
-    _register_prompt("p_fin1", "finished", 1)
-    _register_prompt("p_fin2", "finished", 1)
-    _register_prompt("p_fail", "failure", 1)
+    for uid in ["p0", "p1", "p2", "p3", "p4"]:
+        _register_prompt(uid, 1, n=1)
+    # complete two of them by writing their single session marker
+    _register_session("p2", 0)
+    _register_session("p3", 0)
 
     counts = rb.count_inflight("train")
-    assert counts == {"pending": 1, "running": 1, "finished": 2, "failure": 1}, counts
+    assert counts == {"incomplete": 3, "complete": 2}, counts
+
+
+# ======================================================================================
+# I1b: a prompt is not ready until ALL n sessions complete (no head-of-line on partial groups)
+# ======================================================================================
+def test_prompt_not_ready_until_all_sessions_complete():
+    rb = _make_replay_buffer(strategy="none")
+    _register_prompt("g", 1, n=3)
+    _register_session("g", 0)
+    _register_session("g", 1)
+    assert rb.count_inflight("train") == {"incomplete": 1, "complete": 0}
+    _register_session("g", 2)
+    assert rb.count_inflight("train") == {"incomplete": 0, "complete": 1}
+
+
+# ======================================================================================
+# I1c: a failed session still completes the group (no permanent stall), data is partial
+# ======================================================================================
+def test_failed_session_counts_toward_completion():
+    rb = _make_replay_buffer(strategy="none")
+    _register_prompt("g", 1, n=2)
+    _register_session("g", 0, status="success")
+    _register_session("g", 1, status="failure")  # no data key, but marker completes the group
+    assert rb.count_inflight("train")["complete"] == 1
+
+    batch, _ = rb.sample(global_steps=1, partition_id="train", batch_size=1)
+    # only the successful session contributes a trajectory data key
+    assert {k.split("_")[0] for k in batch.keys} == {"g"}, batch.keys
+    assert len(batch.keys) == 1, batch.keys
+
+
+# ======================================================================================
+# I1d: sample() clears the prompt metadata key + its session markers (trainer clears data keys)
+# ======================================================================================
+def test_sample_clears_prompt_and_session_markers():
+    rb = _make_replay_buffer(strategy="none")
+    _register_prompt("g", 1, n=1)
+    _register_session("g", 0)
+
+    batch, _ = rb.sample(global_steps=1, partition_id="train", batch_size=1)
+    tq.kv_clear(keys=batch.keys, partition_id="train")  # trainer clears the data keys post-consume
+
+    leftover = list(((tq.kv_list() or {}).get("train") or {}).keys())
+    assert leftover == [], leftover  # prompt key + marker cleared by sample, data by trainer
+
+
+# ======================================================================================
+# I1e: pure session-counting helper (no TQ involved)
+# ======================================================================================
+def test_compute_complete_uids_pure():
+    f = _rb.compute_complete_uids
+    assert f({"a": 2, "b": 1}, {"a": {0, 1}, "b": set()}) == {"a"}
+    assert f({"a": 3}, {"a": {0, 1}}) == set()
+    assert f({"a": 1, "b": 1}, {"a": {0}, "b": {0}}) == {"a", "b"}
+    assert f({}, {}) == set()
 
 
 # ======================================================================================
@@ -152,7 +214,7 @@ def test_feeder_throttles_to_budget_against_real_tq():
 
     def feed_one_batch(global_steps):
         uid = f"uid_{len(fed)}"
-        _register_prompt(uid, "pending", global_steps)  # stays pending => never consumed
+        _register_prompt(uid, global_steps, n=1)  # never completed => never consumed
         fed.append(uid)
 
     feeder = StreamingFeeder(
@@ -166,10 +228,10 @@ def test_feeder_throttles_to_budget_against_real_tq():
     time.sleep(0.6)
     feeder.stop()
 
-    # nothing ever finishes/consumed, so the feeder must stop exactly at the budget
+    # nothing ever completes/consumed, so the feeder must stop exactly at the budget
     assert len(fed) == budget, f"expected {budget} fed, got {len(fed)}"
     counts = rb.count_inflight("train")
-    assert counts["pending"] == budget, counts
+    assert counts["incomplete"] == budget, counts
 
 
 # ======================================================================================
@@ -181,7 +243,7 @@ def test_streaming_steady_state_bounded_and_progresses():
     batch_size = 2
 
     state_lock = threading.Lock()
-    pending_uids = []  # uids waiting for the "worker" to finish them
+    pending_uids = []  # uids waiting for the "worker" to complete them
     fed_count = 0
     max_inflight_seen = 0
     param_version = [1]
@@ -189,7 +251,7 @@ def test_streaming_steady_state_bounded_and_progresses():
     def feed_one_batch(global_steps):
         nonlocal fed_count
         uid = uuid.uuid4().hex[:8]
-        _register_prompt(uid, "pending", global_steps)
+        _register_prompt(uid, global_steps, n=1)
         with state_lock:
             pending_uids.append((uid, global_steps))
             fed_count += 1
@@ -205,7 +267,7 @@ def test_streaming_steady_state_bounded_and_progresses():
     stop_worker = threading.Event()
 
     def worker():
-        # simulate the agent-loop worker: turn pending prompts into finished trajectories
+        # simulate the agent-loop worker: complete prompts by writing their session marker + data
         while not stop_worker.is_set():
             item = None
             with state_lock:
@@ -216,14 +278,13 @@ def test_streaming_steady_state_bounded_and_progresses():
                 continue
             uid, gs = item
             time.sleep(0.01)  # simulate generation latency
-            _register_trajectory(uid, gs)
-            _register_prompt(uid, "finished", gs)  # flip prompt status -> sampleable
+            _register_session(uid, 0, "success", gs)  # completes the (n=1) group -> sampleable
 
     consumed = [0]
     stop_consumer = threading.Event()
 
     def consumer():
-        # simulate the trainer step: sample finished prompts (which kv_clears them)
+        # simulate the trainer step: sample complete prompts (which kv_clears them)
         while not stop_consumer.is_set():
             try:
                 # ReplayBuffer.sample returns (KVBatchMeta, off_policy_metrics), matching the
@@ -237,14 +298,13 @@ def test_streaming_steady_state_bounded_and_progresses():
             consumed[0] += len(batch.keys)
             tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
 
-    # sampler watchdog: record peak in-flight while everything runs
+    # monitor: record peak in-flight (sum of all count_inflight buckets) while everything runs
     stop_mon = threading.Event()
 
     def monitor():
         nonlocal max_inflight_seen
         while not stop_mon.is_set():
-            c = rb.count_inflight("train")
-            total = c["pending"] + c["running"] + c["finished"] + c["failure"]
+            total = sum(rb.count_inflight("train").values())
             with state_lock:
                 max_inflight_seen = max(max_inflight_seen, total)
             time.sleep(0.01)
@@ -275,7 +335,7 @@ def test_streaming_steady_state_bounded_and_progresses():
     assert not feeder.error
     # forward progress: prompts were produced and consumed through the full pipeline
     assert fed_count > budget, f"feeder should have produced many batches, got {fed_count}"
-    assert consumed[0] > 0, "consumer should have sampled finished prompts"
+    assert consumed[0] > 0, "consumer should have sampled complete prompts"
     # bounded: the feeder never let in-flight blow far past the budget
     # (small slack for the batch in flight between count and feed)
     assert max_inflight_seen <= budget + batch_size + 2, f"in-flight overshoot: {max_inflight_seen}"
@@ -291,7 +351,7 @@ def test_feeder_pause_blocks_dispatch_against_real_tq():
 
     def feed_one_batch(global_steps):
         uid = f"u_{len(fed)}"
-        _register_prompt(uid, "pending", global_steps)
+        _register_prompt(uid, global_steps, n=1)
         fed.append(uid)
 
     feeder = StreamingFeeder(
@@ -315,9 +375,9 @@ def test_feeder_pause_blocks_dispatch_against_real_tq():
 
     assert n_during_pause == n_at_pause, f"dispatched during pause: {n_at_pause} -> {n_during_pause}"
     assert n_after_resume > n_during_pause, "feeder did not resume dispatching"
-    # TQ reflects exactly what was fed (all left pending, nothing consumed)
+    # TQ reflects exactly what was fed (all left incomplete, nothing consumed)
     counts = rb.count_inflight("train")
-    assert counts["pending"] == n_after_resume, counts
+    assert counts["incomplete"] == n_after_resume, counts
 
 
 # ======================================================================================
@@ -335,12 +395,12 @@ def test_strategy_none_no_staleness_gate():
     # Very stale (gs=1 -> staleness 10, far over any threshold) + fresh (gs=10) prompts.
     for i in range(3):
         uid = f"old{i}"
-        _register_trajectory(uid, 1)
-        _register_prompt(uid, "finished", 1)
+        _register_prompt(uid, 1, n=1)
+        _register_session(uid, 0, "success", 1)
     for i in range(3):
         uid = f"new{i}"
-        _register_trajectory(uid, 10)
-        _register_prompt(uid, "finished", 10)
+        _register_prompt(uid, 10, n=1)
+        _register_session(uid, 0, "success", 10)
 
     batch, metrics = rb.sample(global_steps=global_steps, partition_id="train", batch_size=4)
 

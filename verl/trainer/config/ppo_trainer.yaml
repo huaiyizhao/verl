@@ -247,6 +247,11 @@ trainer:
       # Seconds the feeder sleeps when the in-flight budget is full (avoids busy-waiting)
       feeder_poll_interval: 1.0
 
+      # Per-worker cap on concurrently-executing rollouts (event-loop / GIL pressure knob).
+      # Rollouts are dispatched one session at a time across the worker pool; this bounds how
+      # many run at once inside a single AgentLoopWorker process. 0 = unbounded (legacy behavior).
+      max_concurrent_rollouts_per_worker: 0
+
     # Replay buffer sampling strategy
     sampler:
 

@@ -31,6 +31,20 @@ VERL_REPLAY_BUFFER_DEBUG_INTERVAL_SECONDS = int(os.getenv("VERL_REPLAY_BUFFER_DE
 # https://github.com/Ascend/TransferQueue/blob/main/tutorial/05_custom_sampler.py
 
 
+def compute_complete_uids(prompt_n: dict, session_done: dict) -> set:
+    """Return uids whose all ``n`` GRPO sessions have completed (success or failure).
+
+    Pure function (stdlib only) so session-counting readiness can be unit-tested on a CPU-only
+    machine without TransferQueue. ``prompt_n`` maps uid -> expected session count; ``session_done``
+    maps uid -> set of completed session ids.
+    """
+    complete = set()
+    for uid, n in prompt_n.items():
+        if len(session_done.get(uid, ())) >= n:
+            complete.add(uid)
+    return complete
+
+
 class ReplayBuffer:
     """ReplayBuffer is used by trainer to sample trajectories produced during rollout.
 
@@ -43,7 +57,7 @@ class ReplayBuffer:
     - index: Index of output trajectory in a session.
 
     There're two types of data associated with each key: tag and value. The tag are arbitrary metadata:
-    `{"status": "running", ...}` used to track the status of the trajectory.
+    `{"status": "success", "seq_len": ..., ...}` used to track the status of the trajectory.
 
     The value is a dictionary containing the following fields:
     - messages/datasource/reward_model/...: fields from dataset.
@@ -53,13 +67,15 @@ class ReplayBuffer:
     in storage units.
 
     ### [GRPO group sampling control]
-    Except trajectories, we also store raw prompts in TransferQueue with key `{uid}`, with `status` tag to track
-    status of GRPO group sampling.
-    - pending: the prompt is sampled from dataset but its sessions are not yet started.
-    - running: all sessions of the prompt are running.
-    - finished: all sessions of the prompt are finished without error.
-    - failure: all sessions of the prompt are finished, but at least one session failed.
-    Only prompt with status `finished` or `failure`, its trajectories can be sampled by replay buffer.
+    Readiness is **derived from per-session completion**, not a worker-owned prompt status, so
+    rollouts can be dispatched at the granularity of a single session (decoupled from any worker):
+    - Each prompt is registered with key `{uid}`, tag `{"is_prompt": True, "global_steps", "n"}`,
+      where `n` is the number of GRPO sessions the prompt expects.
+    - Each rollout writes a per-session completion marker `{uid}_sess{session_id}`, tag
+      `{"is_session": True, "session_id", "status"}` where status is `success` or `failure`.
+    A prompt becomes sampleable once all `n` of its session markers are present (success or
+    failure); its trajectories are then collected by `{uid}` prefix. Markers are written after the
+    session's trajectory data, so "all markers present" implies "all available data present".
 
     Args:
         trainer_mode (str): Trainer mode.
@@ -94,23 +110,24 @@ class ReplayBuffer:
             f"Invalid max off policy strategy: {self.max_off_policy_strategy}, must be one of ['drop', 'wait', 'none']"
         )
 
-        # partition_id => {key: tag}
+        # partition_id => {key: tag} for trajectory (data) keys only.
         self.partitions: dict[str, dict[str, dict]] = defaultdict(dict)
-        self.pending_keys: dict[str, set] = defaultdict(set)
-        self.running_keys: dict[str, set] = defaultdict(set)
-        self.finished_keys: dict[str, set] = defaultdict(set)
-        self.failure_keys: dict[str, set] = defaultdict(set)
-        # partition_id => {prompt_key: global_steps}, used to prioritize older samples.
+        # partition_id => {prompt_uid: global_steps}, used to prioritize older samples.
         self.prompt_global_steps: dict[str, dict[str, int]] = defaultdict(dict)
+        # partition_id => {prompt_uid: n}, number of GRPO sessions the prompt expects.
+        self.prompt_n: dict[str, dict[str, int]] = defaultdict(dict)
+        # partition_id => {prompt_uid: set(session_id)}, completed sessions (success or failure).
+        self.session_done: dict[str, dict[str, set]] = defaultdict(lambda: defaultdict(set))
+        # partition_id => {prompt_uid: set(marker_key)}, per-session markers to clear on sample().
+        self.session_marker_keys: dict[str, dict[str, set]] = defaultdict(lambda: defaultdict(set))
 
     def _sync_metadata_from_transfer_queue(self):
         """Sync the metadata from TransferQueue."""
         self.partitions.clear()
-        self.pending_keys.clear()
-        self.running_keys.clear()
-        self.finished_keys.clear()
-        self.failure_keys.clear()
         self.prompt_global_steps.clear()
+        self.prompt_n.clear()
+        self.session_done.clear()
+        self.session_marker_keys.clear()
 
         data = tq.kv_list()
         if data is None:
@@ -120,59 +137,58 @@ class ReplayBuffer:
             partition = self.partitions[partition_id]
             for key, tag in items.items():
                 if tag.get("is_prompt", False):
-                    # see: [GRPO group sampling control]
+                    # see: [GRPO group sampling control] — prompt metadata (global_steps + n).
                     self.prompt_global_steps[partition_id][key] = tag["global_steps"]
-                    match tag["status"]:
-                        case "pending":
-                            self.pending_keys[partition_id].add(key)
-                        case "running":
-                            self.running_keys[partition_id].add(key)
-                        case "finished":
-                            self.finished_keys[partition_id].add(key)
-                        case "failure":
-                            self.failure_keys[partition_id].add(key)
-                        case _:
-                            raise ValueError(f"Unknown status: {tag['status']}")
+                    self.prompt_n[partition_id][key] = tag["n"]
+                elif tag.get("is_session", False):
+                    # Per-session completion marker `{uid}_sess{session_id}`.
+                    uid = key.split("_")[0]
+                    self.session_done[partition_id][uid].add(tag["session_id"])
+                    self.session_marker_keys[partition_id][uid].add(key)
                 else:
                     # see: [Trajectories storage format]
                     if key not in partition:
                         partition[key] = {}
                     partition[key].update(tag)
 
+    def _complete_uids(self, partition_id: str) -> set:
+        """uids whose all ``n`` GRPO sessions have completed (ready to sample)."""
+        return compute_complete_uids(self.prompt_n[partition_id], self.session_done[partition_id])
+
     def count_inflight(self, partition_id: str = "train") -> dict[str, int]:
-        """Return the current TransferQueue prompt counts, for throttling the streaming feeder.
+        """Return the current un-consumed prompt counts, for throttling the streaming feeder.
 
-        - pending + running: prompts that are fed but not yet consumable.
-        - finished + failure: prompts that are ready to be sampled but not yet consumed.
+        - incomplete: prompts fed but whose ``n`` sessions are not all done yet (still generating).
+        - complete: prompts whose sessions are all done — ready to sample, not yet consumed.
 
-        The streaming feeder bounds the sum of all four (total un-consumed prompts) to keep
-        the rollouter from running arbitrarily far ahead of training.
+        The streaming feeder bounds the sum of these (total un-consumed prompts) to keep the
+        rollouter from running arbitrarily far ahead of training.
 
         Args:
             partition_id (str): Partition of TransferQueue, e.g. "train" or "val".
 
         Returns:
-            dict: Counts keyed by "pending", "running", "finished", "failure".
+            dict: Counts keyed by "incomplete" and "complete".
         """
         self._sync_metadata_from_transfer_queue()
-        return {
-            "pending": len(self.pending_keys[partition_id]),
-            "running": len(self.running_keys[partition_id]),
-            "finished": len(self.finished_keys[partition_id]),
-            "failure": len(self.failure_keys[partition_id]),
-        }
+        total = len(self.prompt_global_steps[partition_id])
+        complete = len(self._complete_uids(partition_id))
+        return {"incomplete": total - complete, "complete": complete}
 
     def _has_enough_samples(self, global_steps: int, partition_id: str, batch_size: int) -> bool:
-        # "none" applies no staleness gate: just wait for batch_size finished prompts and sample
+        # "none" applies no staleness gate: just wait for batch_size complete prompts and sample
         # the oldest (streaming bounds staleness via the feeder budget; TIS corrects off-policyness).
-        # For wait strategy, we need to wait all trajectories that reach threshold to finish
+        # For wait strategy, we must wait for all still-incomplete prompts that have reached the
+        # staleness threshold to finish before sampling.
         if self.max_off_policy_strategy == "wait":
-            for key in self.pending_keys[partition_id] | self.running_keys[partition_id]:
-                prompt_global_steps = self.prompt_global_steps[partition_id][key]
+            complete = self._complete_uids(partition_id)
+            for uid, prompt_global_steps in self.prompt_global_steps[partition_id].items():
+                if uid in complete:
+                    continue
                 if (global_steps - prompt_global_steps + 1) / self.parameter_sync_step >= self.max_off_policy_threshold:
                     return False
 
-        return len(self.finished_keys[partition_id]) + len(self.failure_keys[partition_id]) >= batch_size
+        return len(self._complete_uids(partition_id)) >= batch_size
 
     def _drop_max_off_policy_samples(
         self, global_steps: int, partition_id: str, batch: KVBatchMeta
@@ -232,25 +248,27 @@ class ReplayBuffer:
             self._sync_metadata_from_transfer_queue()
 
             if time.time() - last_debug_time > VERL_REPLAY_BUFFER_DEBUG_INTERVAL_SECONDS:
-                logger.info(
-                    f"pending: {len(self.pending_keys[partition_id])}, "
-                    f"running: {len(self.running_keys[partition_id])}, "
-                    f"finished: {len(self.finished_keys[partition_id])}, "
-                    f"failure: {len(self.failure_keys[partition_id])}"
-                )
+                total = len(self.prompt_global_steps[partition_id])
+                complete = len(self._complete_uids(partition_id))
+                logger.info(f"prompts in-flight: {total}, complete(ready): {complete}, incomplete: {total - complete}")
                 last_debug_time = time.time()
 
         # TODO: should we filter out samples with some of their sessions failed?
-        finished_keys = self.finished_keys[partition_id]
-        failure_keys = self.failure_keys[partition_id]
+        complete = self._complete_uids(partition_id)
         # Prioritize sampling the oldest prompts (smallest global_steps first) to reduce staleness.
         prompt_global_steps = self.prompt_global_steps[partition_id]
-        sampleable_keys = sorted(finished_keys.union(failure_keys), key=lambda key: prompt_global_steps.get(key, 0))
+        sampleable_keys = sorted(complete, key=lambda uid: prompt_global_steps.get(uid, 0))
         selected_prompt_uids = sampleable_keys[:batch_size]
-        tq.kv_clear(partition_id=partition_id, keys=selected_prompt_uids)
+        selected = set(selected_prompt_uids)
+
+        # Clear the prompt metadata keys and their per-session completion markers. The trajectory
+        # data keys are cleared by the trainer after the batch is consumed (kv_clear(batch.keys)).
+        marker_keys = []
+        for uid in selected_prompt_uids:
+            marker_keys.extend(self.session_marker_keys[partition_id].get(uid, ()))
+        tq.kv_clear(partition_id=partition_id, keys=list(selected_prompt_uids) + marker_keys)
 
         keys, tags = [], []
-        selected = set(selected_prompt_uids)
         for key, tag in self.partitions[partition_id].items():
             uid = key.split("_")[0]
             if uid in selected:
