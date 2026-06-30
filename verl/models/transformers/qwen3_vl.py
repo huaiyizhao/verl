@@ -218,6 +218,23 @@ def _get_input_embeds(
         n_image_tokens = (input_ids == model.config.image_token_id).sum().item()
         n_image_features = image_embeds.shape[0]
         if n_image_tokens != n_image_features:
+            # Diagnostic dump: show the per-image grid structure so we can tell whether the
+            # mismatch is e.g. one extra/doubled image vs a wholesale desync. image_grid_thw is
+            # [num_images, 3] = (t, h, w); per-image image tokens = t*h*w / merge**2.
+            import logging
+
+            _grid = image_grid_thw
+            _per_img = (_grid[:, 0] * _grid[:, 1] * _grid[:, 2]).tolist() if _grid is not None else None
+            logging.getLogger(__name__).error(
+                "[MM_MISMATCH_FWD] tokens=%d features=%d n_images=%s patches_per_image=%s "
+                "input_ids_shape=%s pixel_values_shape=%s",
+                n_image_tokens,
+                n_image_features,
+                int(_grid.shape[0]) if _grid is not None else None,
+                _per_img,
+                tuple(input_ids.shape),
+                tuple(pixel_values.shape),
+            )
             raise ValueError(
                 f"Image features and image tokens do not match: tokens: {n_image_tokens}, features {n_image_features}"
             )

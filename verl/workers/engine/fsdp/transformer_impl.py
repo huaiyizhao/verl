@@ -79,6 +79,102 @@ from .utils import create_device_mesh, get_sharding_strategy
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+# Diagnostic: per-row image-token/feature consistency check on the FULL batch before
+# micro-batch packing. Localizes the "Image features and image tokens do not match" crash --
+# if rows are individually consistent here but a packed micro-batch is not, the bug is in
+# packing; if a row is already inconsistent here, it is in materialize/resolve. Logs at
+# ERROR/WARNING (INFO is swallowed by the worker handler). Gated by VERL_PROFILE.
+_MM_ROWCHECK = os.getenv("VERL_PROFILE", "0") not in ("0", "false", "False", "")
+_MM_ROWCHECK_OK_LOGGED = [0]  # cap the "all consistent" confirmations so they never spam
+
+
+def _mm_fingerprint(mm) -> str | None:
+    """Cheap content fingerprint of a row's multimodal pixels, to detect cross-row duplication."""
+    pv = mm.get("pixel_values") if mm else None
+    grid = mm.get("image_grid_thw") if mm else None
+    if pv is None or grid is None:
+        return None
+    try:
+        flat = pv.reshape(-1).to(torch.float32)
+        sample = flat[:: max(1, flat.numel() // 16)][:16]
+        digest = "|".join(f"{float(x):.3e}" for x in sample.tolist())
+        return f"shape={tuple(pv.shape)} grid={grid.reshape(-1).tolist()} s={digest}"
+    except Exception:  # noqa: BLE001
+        return f"shape={tuple(pv.shape)}"
+
+
+def _mm_rowcheck(data, module, where: str) -> None:
+    """Check, per row of a full pre-pack batch, that image placeholder tokens == image features.
+
+    On mismatch, also fingerprints each row's pixels and reports whether an inconsistent row's
+    images DUPLICATE another row's (=> column misalignment/wrap in materialize/resolve) or are
+    UNIQUE (=> the row genuinely carries images its text never referenced, e.g. truncation).
+    """
+    try:
+        mm_col = data.get("multi_modal_inputs", None)
+        if mm_col is None:
+            return
+        cfg = getattr(module, "module", module).config
+        image_token_id = getattr(cfg, "image_token_id", None)
+        if image_token_id is None:
+            return
+        vcfg = getattr(cfg, "vision_config", None)
+        merge = getattr(vcfg, "spatial_merge_size", None) or getattr(cfg, "spatial_merge_size", None) or 2
+        input_ids = data["input_ids"]
+        n = int(data.batch_size[0])
+        rows = []  # (i, n_tok, n_feat, n_img, fingerprint)
+        for i in range(n):
+            mm = mm_col[i]
+            mm = mm.data if hasattr(mm, "data") else mm
+            grid = mm.get("image_grid_thw") if mm else None
+            if grid is None:
+                continue
+            row_ids = input_ids[i]
+            row_ids = row_ids.values() if getattr(row_ids, "is_nested", False) else row_ids
+            n_tok = int((row_ids == image_token_id).sum())
+            n_feat = int((grid[:, 0] * grid[:, 1] * grid[:, 2]).sum()) // (merge * merge)
+            rows.append((i, n_tok, n_feat, int(grid.shape[0]), _mm_fingerprint(mm)))
+        img_rows = len(rows)
+        bad = [r for r in rows if r[1] != r[2]]
+        fp_to_rows: dict[str, list[int]] = {}
+        for i, _, _, _, fp in rows:
+            if fp is not None:
+                fp_to_rows.setdefault(fp, []).append(i)
+        if bad:
+            for i, n_tok, n_feat, n_img, fp in bad:
+                dup = [j for j in fp_to_rows.get(fp, []) if j != i]
+                logger.error(
+                    "[MM_ROWCHECK] where=%s row=%d/%d image_tokens=%d features=%d n_images=%d dup_of_rows=%s fp=%s",
+                    where,
+                    i,
+                    n,
+                    n_tok,
+                    n_feat,
+                    n_img,
+                    dup if dup else "UNIQUE",
+                    fp,
+                )
+            logger.error(
+                "[MM_ROWCHECK] where=%s %d/%d image-rows INCONSISTENT pre-pack -> bug is in "
+                "materialize/resolve (NOT packing); n_unique_fingerprints=%d/%d",
+                where,
+                len(bad),
+                img_rows,
+                len(fp_to_rows),
+                img_rows,
+            )
+        elif img_rows and _MM_ROWCHECK_OK_LOGGED[0] < 5:
+            _MM_ROWCHECK_OK_LOGGED[0] += 1
+            logger.warning(
+                "[MM_ROWCHECK] where=%s all %d image-rows consistent pre-pack -> if forward still "
+                "crashes, bug is in packing",
+                where,
+                img_rows,
+            )
+    except Exception as e:  # noqa: BLE001 - diagnostic must never break training
+        logger.error("[MM_ROWCHECK] check failed: %r", e)
+
+
 device_name = get_device_name()
 
 
@@ -646,6 +742,9 @@ class FSDPEngine(BaseEngine):
         )
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
+
+        if _MM_ROWCHECK:
+            _mm_rowcheck(data, self.module, where="forward_only" if forward_only else "train")
 
         micro_batches, indices = prepare_micro_batches(
             data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True

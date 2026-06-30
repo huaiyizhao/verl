@@ -508,6 +508,12 @@ class AgentLoopWorker:
         self.tokenizer = self.model_config.tokenizer
         self.processor = self.model_config.processor
         self.mm_processor_kwargs = config.data.get("mm_processor_kwargs", {})
+        # Optionally store multimodal pixel tensors as bf16 to ~halve their footprint in the
+        # streaming queue's storage units (the model consumes bf16 anyway). Read from the raw
+        # config so it works without a strict dataclass field; default off.
+        self._store_mm_bf16 = bool(
+            OmegaConf.select(config, "trainer.v1.fully_async.multimodal_storage_bf16", default=False)
+        )
 
         # Online policy distillation
         self.distillation_enabled = is_distillation_enabled(config.distillation)
@@ -889,6 +895,12 @@ class AgentLoopWorker:
         if image_grid_thw is not None:
             images_seqlens = torch.repeat_interleave(image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0])
             multi_modal_inputs["images_seqlens"] = images_seqlens
+        if self._store_mm_bf16:
+            # Downcast only the large float pixel tensors; grid/seqlen tensors stay integer.
+            for key in ("pixel_values", "pixel_values_videos"):
+                tensor = multi_modal_inputs.get(key)
+                if tensor is not None and torch.is_floating_point(tensor):
+                    multi_modal_inputs[key] = tensor.to(torch.bfloat16)
         return multi_modal_inputs
 
     def _compute_position_ids(

@@ -65,6 +65,10 @@ except ImportError:
 from verl.utils import tensordict_utils as tu
 
 logger = logging.getLogger(__name__)
+
+# Master profiling switch: VERL_PROFILE=1 turns on all custom processing-time profiling
+# (trainer-side materialization / multimodal resolve, and the rollout-worker postprocess).
+_PROFILE = os.getenv("VERL_PROFILE", "0") not in ("0", "false", "False", "")
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 TQ_INITIALIZED = False
@@ -118,13 +122,34 @@ async def _async_meta_to_realdata(meta: BatchMeta | KVBatchMeta) -> TensorDict:
         return empty_td
 
     tq_client = tq.get_client()
+    _t = time.perf_counter()
     tensordict = await tq_client.async_get_data(meta)
+    t_fetch = time.perf_counter() - _t
 
     for key, val in meta_info.items():
         if isinstance(val, (NonTensorData | NonTensorStack)):
             tensordict[key] = val
         else:
             tu.assign_non_tensor_data(tensor_dict=tensordict, key=key, val=val)
+
+    # Resolve any deduped image references back into multi_modal_inputs (no-op
+    # unless the batch carries an image_ids column, i.e. image dedup is active).
+    from verl.utils.transferqueue_image_dedup import maybe_resolve_image_ids
+
+    _t = time.perf_counter()
+    tensordict = await maybe_resolve_image_ids(tensordict)
+    t_resolve = time.perf_counter() - _t
+
+    if _PROFILE:
+        n_rows = int(tensordict.batch_size[0]) if len(tensordict.batch_size) else -1
+        logger.warning(
+            "[MATERIALIZE_PROFILE] n_rows=%d fields=%d data_fetch=%.3fs mm_resolve=%.3fs total=%.3fs",
+            n_rows,
+            len(list(tensordict.keys())),
+            t_fetch,
+            t_resolve,
+            t_fetch + t_resolve,
+        )
     return tensordict
 
 
