@@ -73,6 +73,9 @@ algorithm:
   # Whether to normalize advantages by std (specific to GRPO)
   norm_adv_by_std_in_grpo: True
 
+  # Minimum std denominator when normalizing GRPO advantages. 0 disables the floor.
+  grpo_adv_std_floor: 0.0
+
   # Whether to enable in-reward KL penalty
   use_kl_in_reward: False
 
