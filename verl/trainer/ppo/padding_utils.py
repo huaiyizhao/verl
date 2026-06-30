@@ -114,6 +114,14 @@ def construct_minimal_padding_template(
     )
     if "multi_modal_inputs" in template_sample:
         template_sample["multi_modal_inputs"] = {}
+    # The image-dedup path stores image references in ``image_ids`` (a delimiter-joined string,
+    # ``""`` == no images) instead of inline ``multi_modal_inputs``. A padding row is a text-only
+    # 2-token sequence with NO image placeholder, so it must reference no images. Without this it
+    # inherits the template's real ``image_ids`` -> at resolve time a real image is attached to a
+    # 0-image-token row (and every padding row shares the same one), triggering the training-time
+    # "Image features and image tokens do not match" crash.
+    if "image_ids" in template_sample:
+        template_sample["image_ids"] = ""
     if routed_experts is not None:
         template_sample["routed_experts"] = routed_experts
     else:

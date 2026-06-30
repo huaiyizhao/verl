@@ -244,11 +244,14 @@ trainer:
       # Seconds the feeder sleeps when the in-flight budget is full (avoids busy-waiting)
       feeder_poll_interval: 1.0
 
-      # Per-worker cap on concurrently-executing rollouts (event-loop / GIL pressure knob), read by
-      # the opt-in rollout-level worker (RolloutAgentLoopManagerTQ). Rollouts are dispatched one
-      # session at a time across the worker pool; this bounds how many run at once inside a single
-      # AgentLoopWorker process. 0 = unbounded (legacy behavior).
+      # Per-worker cap on concurrently-executing rollouts (event-loop / GIL pressure knob).
+      # Rollouts are dispatched one session at a time across the worker pool; this bounds how
+      # many run at once inside a single AgentLoopWorker process. 0 = unbounded (legacy behavior).
       max_concurrent_rollouts_per_worker: 0
+
+      # Store multimodal pixel tensors (pixel_values) as bf16 in TransferQueue to ~halve their
+      # RAM footprint in the storage-unit actors. The model consumes bf16 anyway. false = float32.
+      multimodal_storage_bf16: false
 
     # Replay buffer sampling strategy
     sampler:
