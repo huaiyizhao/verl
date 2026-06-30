@@ -89,4 +89,17 @@ def compute_advantage_for_multi_trajectories(
 
     data.batch["advantages"] = scores
     data.batch["returns"] = scores
+
+    response_mask = data.batch["response_mask"]
+    response_tokens = response_mask.to(torch.float32).sum(dim=-1)
+    session_tokens: dict[str, float] = {}
+    for i, session_key in enumerate(row_session_keys):
+        session_tokens[session_key] = session_tokens.get(session_key, 0.0) + float(response_tokens[i].item())
+
+    rollout_count = max(len(session_tokens), 1)
+    scales = torch.empty(len(data), dtype=torch.float32, device=response_mask.device)
+    for i, session_key in enumerate(row_session_keys):
+        total_tokens = session_tokens.get(session_key, 0.0)
+        scales[i] = (1.0 / (rollout_count * total_tokens**0.5)) if total_tokens > 0.0 else 0.0
+    data.batch["rollout_loss_weights"] = response_mask.to(torch.float32) * scales.unsqueeze(-1)
     return data

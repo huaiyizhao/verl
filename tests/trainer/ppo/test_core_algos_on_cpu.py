@@ -21,6 +21,7 @@ import torch
 
 import verl.trainer.ppo.core_algos
 from verl.trainer.ppo.core_algos import (
+    agg_loss,
     compute_gae_advantage_return,
     compute_grpo_outcome_advantage,
     compute_grpo_vectorized_outcome_advantage,
@@ -278,6 +279,64 @@ def test_grpo_vectorized_matches_original_for_low_variance_rewards():
 
     assert torch.allclose(adv1, adv2, rtol=1e-5, atol=1e-6)
     assert torch.allclose(ret1, ret2, rtol=1e-5, atol=1e-6)
+
+
+def test_grpo_advantage_std_floor():
+    token_level_rewards = torch.tensor([[0.0], [0.02]], dtype=torch.float32)
+    response_mask = torch.ones_like(token_level_rewards)
+    index = np.array([0, 0])
+    config = {"grpo_adv_std_floor": 0.1}
+
+    adv, ret = compute_grpo_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        norm_adv_by_std_in_grpo=True,
+        config=config,
+    )
+    expected = torch.tensor([[-0.01 / 0.100001], [0.01 / 0.100001]], dtype=torch.float32)
+
+    assert torch.allclose(adv, expected, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(ret, expected, rtol=1e-5, atol=1e-6)
+
+    vec_adv, vec_ret = compute_grpo_vectorized_outcome_advantage(
+        token_level_rewards=token_level_rewards,
+        response_mask=response_mask,
+        index=index,
+        norm_adv_by_std_in_grpo=True,
+        config=config,
+    )
+    assert torch.allclose(vec_adv, expected, rtol=1e-5, atol=1e-6)
+    assert torch.allclose(vec_ret, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_rollout_mean_token_sum_sqrt_norm_loss():
+    loss_mat = torch.ones((3, 3), dtype=torch.float32)
+    loss_mask = torch.tensor(
+        [
+            [1, 1, 0],
+            [1, 1, 0],
+            [1, 0, 0],
+        ],
+        dtype=torch.bool,
+    )
+    rollout_loss_weights = torch.tensor(
+        [
+            [0.25, 0.25, 0.0],
+            [0.25, 0.25, 0.0],
+            [0.5, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    loss = agg_loss(
+        loss_mat=loss_mat,
+        loss_mask=loss_mask,
+        loss_agg_mode="rollout-mean-token-sum-sqrt-norm",
+        rollout_loss_weights=rollout_loss_weights,
+    )
+
+    assert torch.allclose(loss, torch.tensor(1.5), rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.parametrize(
