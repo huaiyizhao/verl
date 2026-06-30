@@ -833,7 +833,12 @@ def compute_rollout_correction_and_rejection_mask(
     """
     # Validate input masks
     if not response_mask.any():
-        raise ValueError("response_mask must contain at least one valid token (1).")
+        # An all-padding micro-batch: dynamic-bsz can group the synthetic 2-token padding rows
+        # (used to make the batch divisible; their response_mask is all-zero) into a single
+        # micro-batch. There is nothing to correct or reject, so return a no-op. The downstream
+        # policy loss uses NaN-safe masked_mean (denominator + 1e-8), so it evaluates to zero for
+        # this micro-batch and contributes no gradient.
+        return None, response_mask.clone(), {}
     if old_log_prob.shape != rollout_log_prob.shape:
         raise ValueError(
             f"old_log_prob shape {old_log_prob.shape} does not match rollout_log_prob shape {rollout_log_prob.shape}."
