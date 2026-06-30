@@ -442,6 +442,30 @@ def test_seq_fraction_high_uses_raw_weights():
     assert metrics["rollout_is_seq_fraction_high"] == pytest.approx(0.5)
 
 
+def test_all_padding_microbatch_is_noop():
+    """An all-zero response_mask (a micro-batch of only synthetic padding rows) must be a no-op,
+    not a crash. dynamic-bsz can group the 2-token padding rows (response_mask all-zero) into one
+    micro-batch; the rollout correction has nothing to do and must return cleanly so the downstream
+    NaN-safe masked-mean loss evaluates to zero for it."""
+    bsz, seqlen = 4, 5
+    response_mask = torch.zeros(bsz, seqlen)
+    log_prob = torch.randn(bsz, seqlen)
+
+    proto, modified_mask, metrics = compute_rollout_correction_and_rejection_mask(
+        old_log_prob=log_prob,
+        rollout_log_prob=torch.randn(bsz, seqlen),
+        response_mask=response_mask,
+        rollout_is=None,
+        rollout_is_threshold=None,
+        rollout_rs="seq_mean_k3",
+        rollout_rs_threshold=0.005,
+    )
+
+    assert proto is None
+    assert metrics == {}
+    assert not modified_mask.any()  # mask unchanged (still all-zero)
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("Rollout Correction Test Suite")
