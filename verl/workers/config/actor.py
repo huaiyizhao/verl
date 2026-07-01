@@ -321,6 +321,9 @@ class FSDPActorConfig(ActorConfig):
         # EngineConfig.strategy defaults to None, so without this, engine_workers.py always
         # falls back to FSDP1 even when actor.strategy="fsdp2".
         object.__setattr__(self.engine, "strategy", self.strategy)
+        # Sync freeze_vision_tower to the engine config so the FSDP engine can freeze the ViT
+        # (the flag lives on ActorConfig but the engine only sees engine_config).
+        object.__setattr__(self.engine, "freeze_vision_tower", self.freeze_vision_tower)
 
         # backward compatibility
         if self.ulysses_sequence_parallel_size > 1:

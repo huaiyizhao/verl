@@ -664,6 +664,42 @@ class FSDPEngine(BaseEngine):
 
         logger.info(f"[QAT W4A4] Restored {loaded_count} input_global_scale/input_amax from {model_path}")
 
+    # Attribute names used by HF VLMs for the vision encoder (the "vision tower"). A module whose
+    # leaf name matches one of these — e.g. Qwen2/3-VL's ``visual`` — has all its params frozen.
+    _VISION_TOWER_NAMES = ("visual", "vision_tower", "vision_model")
+
+    def _freeze_vision_tower(self, module) -> int:
+        """Set ``requires_grad=False`` on every vision-tower parameter of ``module``.
+
+        Returns the number of frozen parameters. Warns (does not raise) if no vision tower is
+        found, so a mis-set flag on a text-only model degrades gracefully. Called before FSDP
+        wrapping so ``module`` is still the plain HF model with readable submodule names.
+        """
+        frozen_ids: set[int] = set()
+        n_frozen = 0
+        towers: list[str] = []
+        for mod_name, submod in module.named_modules():
+            if mod_name.split(".")[-1] not in self._VISION_TOWER_NAMES:
+                continue
+            towers.append(mod_name)
+            for p in submod.parameters():  # recursive; dedup across overlapping matches
+                if id(p) not in frozen_ids and p.requires_grad:
+                    p.requires_grad_(False)
+                    frozen_ids.add(id(p))
+                    n_frozen += p.numel()
+        if not towers:
+            logger.warning(
+                "freeze_vision_tower=True but no vision-tower submodule (%s) was found; nothing was frozen.",
+                "/".join(self._VISION_TOWER_NAMES),
+            )
+        elif self.rank == 0:
+            logger.info(
+                "freeze_vision_tower: froze %.1fM params in %s (requires_grad=False)",
+                n_frozen / 1e6,
+                towers[:3],
+            )
+        return n_frozen
+
     def _build_model_optimizer(self):
         from verl.utils.model import print_model_size
 
@@ -676,6 +712,13 @@ class FSDPEngine(BaseEngine):
         # Apply QAT before FSDP wrapping (training only)
         if self._qat_enabled and not self.engine_config.forward_only:
             module = self._apply_qat(module)
+
+        # Freeze the vision tower (ViT) before FSDP wrap + optimizer build, so FSDP sees the frozen
+        # params and the optimizer never allocates state for them. No-op for LoRA (base already
+        # frozen). The ViT forward still runs to produce image embeddings; only its backward is
+        # skipped (its params + the pixel inputs carry no grad).
+        if not self._is_lora and getattr(self.engine_config, "freeze_vision_tower", False):
+            self._freeze_vision_tower(module)
 
         # Synchronize all distributed processes before proceeding
         torch.distributed.barrier()

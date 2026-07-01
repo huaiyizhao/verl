@@ -85,6 +85,7 @@ class EngineConfig(BaseConfig):
         "use_remove_padding",
         "forward_only",
         "param_offload",
+        "freeze_vision_tower",
     }
     # whether to offload param
     param_offload: bool = False
@@ -110,6 +111,10 @@ class EngineConfig(BaseConfig):
     use_fused_kernels: bool = False
     # TODO (this may conflict with the one in model config)
     use_remove_padding: bool = True
+    # freeze the vision tower (ViT) of a VLM during training: the ViT forward still runs to
+    # produce image embeddings, but its params get requires_grad=False so backward/optimizer skip
+    # it. Synced from ActorConfig.freeze_vision_tower in the actor config __post_init__.
+    freeze_vision_tower: bool = False
 
     seed: int = 42
 
