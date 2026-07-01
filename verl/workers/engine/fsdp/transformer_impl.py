@@ -18,6 +18,7 @@ The concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP)
 import gc
 import logging
 import os
+import time
 import warnings
 from contextlib import nullcontext
 from typing import Callable, ContextManager, Optional
@@ -38,7 +39,7 @@ from verl.utils.activation_offload import enable_activation_offloading
 from verl.utils.checkpoint.fsdp_checkpoint_manager import FSDPCheckpointManager
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.debug import log_gpu_memory_usage
-from verl.utils.device import get_device_id, get_device_name
+from verl.utils.device import get_device_id, get_device_name, get_torch_device
 from verl.utils.fsdp_utils import (
     CPUOffloadPolicy,
     FSDPModule,
@@ -86,6 +87,12 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 # ERROR/WARNING (INFO is swallowed by the worker handler). Gated by VERL_PROFILE.
 _MM_ROWCHECK = os.getenv("VERL_PROFILE", "0") not in ("0", "false", "False", "")
 _MM_ROWCHECK_OK_LOGGED = [0]  # cap the "all consistent" confirmations so they never spam
+
+# Lightweight forward-vs-backward split within update_actor ([FBP_PROFILE], printed on rank 0),
+# to tell compute (fwd/bwd) apart from data-fetch ([MATERIALIZE_PROFILE]). Device-synced so the
+# split is accurate under async CUDA; gated by the master VERL_PROFILE or the narrower
+# VERL_STEP_PROFILE (same knob as the trainer's [STEP_PROFILE]). Zero overhead when off.
+_FBP_PROFILE = _MM_ROWCHECK or os.getenv("VERL_STEP_PROFILE", "0") not in ("0", "false", "False", "")
 
 
 def _mm_fingerprint(mm) -> str | None:
@@ -758,17 +765,43 @@ class FSDPEngine(BaseEngine):
         # and _build_fsdp_module, so self.scaler may not be set.
         scaler = getattr(self, "scaler", None)
 
+        # [FBP_PROFILE] fwd/bwd split (device-synced) — see _FBP_PROFILE. Off by default.
+        _prof = _FBP_PROFILE
+        _dev = get_torch_device() if _prof else None
+        t_fwd = t_bwd = 0.0
+
         for micro_batch in micro_batches:
             with ctx:
+                if _prof:
+                    _dev.synchronize()
+                    _t = time.perf_counter()
                 loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
+                if _prof:
+                    _dev.synchronize()
+                    t_fwd += time.perf_counter() - _t
 
                 if not forward_only:
+                    if _prof:
+                        _t = time.perf_counter()
                     if scaler is not None:
                         scaler.scale(loss).backward()
                     else:
                         loss.backward()
+                    if _prof:
+                        _dev.synchronize()
+                        t_bwd += time.perf_counter() - _t
 
             output_lst.append(meta_info)
+
+        if _prof and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0):
+            # fwd includes the vision-tower forward (ViT is NOT frozen — freeze_vision_tower is a
+            # no-op in this build); bwd includes FSDP grad reduce-scatter. Compare against
+            # [MATERIALIZE_PROFILE] (data-fetch) to see if the step is compute- or data-bound.
+            print(
+                f"[FBP_PROFILE] mode={'fwd_only' if forward_only else 'train'} "
+                f"n_micro={len(micro_batches)} fwd={t_fwd:.2f}s bwd={t_bwd:.2f}s",
+                flush=True,
+            )
 
         # postprocess and return
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)

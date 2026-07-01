@@ -69,6 +69,10 @@ logger = logging.getLogger(__name__)
 # Master profiling switch: VERL_PROFILE=1 turns on all custom processing-time profiling
 # (trainer-side materialization / multimodal resolve, and the rollout-worker postprocess).
 _PROFILE = os.getenv("VERL_PROFILE", "0") not in ("0", "false", "False", "")
+# [MATERIALIZE_PROFILE] (data-fetch + mm-resolve) also fires under the narrower VERL_STEP_PROFILE,
+# so the data-fetch cost shows next to the trainer's [STEP_PROFILE] / [FBP_PROFILE] without turning
+# on the heavy per-row diagnostics that VERL_PROFILE gates.
+_STEP_PROFILE = _PROFILE or os.getenv("VERL_STEP_PROFILE", "0") not in ("0", "false", "False", "")
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 TQ_INITIALIZED = False
@@ -140,7 +144,7 @@ async def _async_meta_to_realdata(meta: BatchMeta | KVBatchMeta) -> TensorDict:
     tensordict = await maybe_resolve_image_ids(tensordict)
     t_resolve = time.perf_counter() - _t
 
-    if _PROFILE:
+    if _STEP_PROFILE:
         n_rows = int(tensordict.batch_size[0]) if len(tensordict.batch_size) else -1
         logger.warning(
             "[MATERIALIZE_PROFILE] n_rows=%d fields=%d data_fetch=%.3fs mm_resolve=%.3fs total=%.3fs",
