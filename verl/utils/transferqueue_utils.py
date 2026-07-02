@@ -146,13 +146,13 @@ async def _async_meta_to_realdata(meta: BatchMeta | KVBatchMeta) -> TensorDict:
 
     if _STEP_PROFILE:
         n_rows = int(tensordict.batch_size[0]) if len(tensordict.batch_size) else -1
-        logger.warning(
-            "[MATERIALIZE_PROFILE] n_rows=%d fields=%d data_fetch=%.3fs mm_resolve=%.3fs total=%.3fs",
-            n_rows,
-            len(list(tensordict.keys())),
-            t_fetch,
-            t_resolve,
-            t_fetch + t_resolve,
+        # print (not logger.warning): the worker's logging handler swallows this line, so it never
+        # reached stdout/the driver log. print(flush) makes the per-worker data-fetch/resolve cost
+        # visible next to [STEP_PROFILE]/[FBP_PROFILE].
+        print(
+            f"[MATERIALIZE_PROFILE] n_rows={n_rows} fields={len(list(tensordict.keys()))} "
+            f"data_fetch={t_fetch:.3f}s mm_resolve={t_resolve:.3f}s total={t_fetch + t_resolve:.3f}s",
+            flush=True,
         )
     return tensordict
 
