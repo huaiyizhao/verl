@@ -65,8 +65,12 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-# Master profiling switch: VERL_PROFILE=1 logs the dedup-resolve fetch/reconstruct breakdown.
+# Master profiling switch: VERL_PROFILE=1 logs the dedup-resolve fetch/reconstruct breakdown
+# (plus the heavy per-row [RESOLVE_DBG] dumps). The lighter VERL_STEP_PROFILE turns on ONLY the
+# [RESOLVE_PROFILE] fetch-vs-reconstruct timing (which splits the [MATERIALIZE_PROFILE] mm_resolve),
+# without the heavy dumps.
 _PROFILE = os.getenv("VERL_PROFILE", "0") not in ("0", "false", "False", "")
+_STEP_PROFILE = _PROFILE or os.getenv("VERL_STEP_PROFILE", "0") not in ("0", "false", "False", "")
 _RESOLVE_DBG = [0]  # cap the per-row image_ids dump so it never floods the log
 
 # Separate TQ partitions for deduped image payloads (train / validation kept
@@ -379,17 +383,15 @@ async def resolve_image_ids(
     del tensordict[IMAGE_IDS_KEY]
     t_reconstruct = time.perf_counter() - _t
 
-    if _PROFILE:
+    if _STEP_PROFILE:
         total_imgs = sum(len(ids) for ids in image_ids_per_row)
-        logger.warning(
-            "[RESOLVE_PROFILE] n_rows=%d total_image_refs=%d unique_fetched=%d img_fetch=%.3fs "
-            "reconstruct=%.3fs total=%.3fs",
-            n,
-            total_imgs,
-            len(needed),
-            t_fetch,
-            t_reconstruct,
-            t_fetch + t_reconstruct,
+        # print (not logger.warning): the worker logging handler swallows warnings. This splits the
+        # [MATERIALIZE_PROFILE] mm_resolve into image FETCH (ZMQ get of the unique images) vs
+        # RECONSTRUCT (per-row torch.cat), so we know which half of the ~77s to attack.
+        print(
+            f"[RESOLVE_PROFILE] n_rows={n} total_image_refs={total_imgs} unique_fetched={len(needed)} "
+            f"img_fetch={t_fetch:.3f}s reconstruct={t_reconstruct:.3f}s total={t_fetch + t_reconstruct:.3f}s",
+            flush=True,
         )
     return tensordict
 
