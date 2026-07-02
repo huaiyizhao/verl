@@ -397,6 +397,13 @@ async def resolve_image_ids(
 # Per-worker LRU of resolved image payloads, shared across the
 # old_log_prob / ref / update_actor passes within a step. Lazily created so the
 # default (dedup-off) path never allocates it.
+#
+# Size (in cached images) of the persistent cross-step LRU. Each cached payload is a full
+# ``pixel_values`` tensor (~10-20 MB), so at the old default of 2048 the cache alone pinned
+# ~25 GB of host RAM per worker. Default 0 = DISABLED: use a per-call cache instead (still dedups
+# within a batch, but drops afterward) so hot screenshots never accumulate across steps. Set
+# VERL_IMAGE_LRU_MAXSIZE>0 to re-enable the cross-step cache (trades host RAM for fewer TQ fetches).
+_IMAGE_LRU_MAXSIZE = int(os.getenv("VERL_IMAGE_LRU_MAXSIZE", "0"))
 _WORKER_IMAGE_LRU: ImageLRU | None = None
 
 
@@ -407,14 +414,19 @@ async def maybe_resolve_image_ids(tensordict: Any) -> Any:
     :func:`verl.utils.transferqueue_utils._async_meta_to_realdata`. A no-op unless
     the batch carries an ``image_ids`` column — only train rows written by the
     dedup producer do — so the default (dedup-off) path and validation are
-    untouched. Manages a process-local :class:`ImageLRU` so a hot screenshot is
-    fetched once per worker.
+    untouched. With ``VERL_IMAGE_LRU_MAXSIZE>0`` a process-local :class:`ImageLRU`
+    keeps hot screenshots across steps; by default (0) a per-call cache is used so
+    nothing is pinned across steps.
     """
     if IMAGE_IDS_KEY not in tensordict.keys():
         return tensordict
+    if _IMAGE_LRU_MAXSIZE <= 0:
+        # Persistent cache disabled: cache=None -> resolve_image_ids builds a fresh per-call cache
+        # (dedups within this batch, freed on return). No cross-step accumulation.
+        return await resolve_image_ids(tensordict, cache=None)
     global _WORKER_IMAGE_LRU
     if _WORKER_IMAGE_LRU is None:
-        _WORKER_IMAGE_LRU = ImageLRU()
+        _WORKER_IMAGE_LRU = ImageLRU(maxsize=_IMAGE_LRU_MAXSIZE)
     return await resolve_image_ids(tensordict, cache=_WORKER_IMAGE_LRU)
 
 

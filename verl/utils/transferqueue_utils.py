@@ -146,12 +146,44 @@ async def _async_meta_to_realdata(meta: BatchMeta | KVBatchMeta) -> TensorDict:
 
     if _STEP_PROFILE:
         n_rows = int(tensordict.batch_size[0]) if len(tensordict.batch_size) else -1
-        # print (not logger.warning): the worker's logging handler swallows this line, so it never
-        # reached stdout/the driver log. print(flush) makes the per-worker data-fetch/resolve cost
-        # visible next to [STEP_PROFILE]/[FBP_PROFILE].
+        # Per-worker memory breakdown so the log pinpoints where host RAM goes (the OOM is on the
+        # host, not the GPU): rss = whole worker-process host memory; gpu_* = device memory (separate
+        # from rss); batch_mm = bytes of THIS materialized batch's multi_modal (pixel) tensors on
+        # host. If rss >> batch_mm, the host bloat is NOT the image batch (=> vLLM colocation /
+        # weight-sync buffers / fragmentation). Tracking rss across steps shows leak vs steady-state.
+        rss = gpu_a = gpu_r = batch_mm = -1.0
+        try:
+            import psutil
+
+            rss = psutil.Process().memory_info().rss / 1e9
+        except Exception:
+            pass
+        try:
+            from verl.utils.device import get_torch_device
+
+            _dev = get_torch_device()
+            gpu_a = _dev.memory_allocated() / 1e9
+            gpu_r = _dev.memory_reserved() / 1e9
+        except Exception:
+            pass
+        try:
+            mmi = tensordict.get("multi_modal_inputs", None)
+            if mmi is not None:
+                total = 0
+                for i in range(n_rows):
+                    row = mmi[i]
+                    row = row.data if hasattr(row, "data") else row
+                    if isinstance(row, dict):
+                        total += sum(int(v.nbytes) for v in row.values() if hasattr(v, "nbytes"))
+                batch_mm = total / 1e9
+        except Exception:
+            pass
+        # print (not logger.warning): the worker's logging handler swallows warnings, so this never
+        # reached the driver log; print(flush) makes it visible next to [STEP_PROFILE]/[FBP_PROFILE].
         print(
             f"[MATERIALIZE_PROFILE] n_rows={n_rows} fields={len(list(tensordict.keys()))} "
-            f"data_fetch={t_fetch:.3f}s mm_resolve={t_resolve:.3f}s total={t_fetch + t_resolve:.3f}s",
+            f"data_fetch={t_fetch:.3f}s mm_resolve={t_resolve:.3f}s "
+            f"batch_mm={batch_mm:.1f}G rss={rss:.1f}G gpu_alloc={gpu_a:.1f}G gpu_resv={gpu_r:.1f}G",
             flush=True,
         )
     return tensordict
