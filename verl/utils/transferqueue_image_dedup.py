@@ -72,11 +72,6 @@ logger = logging.getLogger(__name__)
 _PROFILE = os.getenv("VERL_PROFILE", "0") not in ("0", "false", "False", "")
 _STEP_PROFILE = _PROFILE or os.getenv("VERL_STEP_PROFILE", "0") not in ("0", "false", "False", "")
 _RESOLVE_DBG = [0]  # cap the per-row image_ids dump so it never floods the log
-# Bounded record of image keys this worker has cleared, so resolve can tell WHY a referenced image
-# is missing: if it's in here -> a clear-path bug (cleared while still referenced); if not -> the
-# image was never stored (rollout worker died / kv_put lost). Definitively categorizes the crash.
-_CLEARED_KEYS: "OrderedDict[str, None]" = OrderedDict()
-_CLEARED_KEYS_CAP = 400000
 
 # Separate TQ partitions for deduped image payloads (train / validation kept
 # apart so val GC never deletes a train image and vice-versa).
@@ -307,20 +302,16 @@ async def resolve_image_ids(
         missing = {k for ids in image_ids_per_row for k in ids if k not in existing}
         if missing:
             keep = [i for i, ids in enumerate(image_ids_per_row) if not any(k in missing for k in ids)]
-            # ROOT-CAUSE tag: was each missing image CLEARED by this worker (clear-path bug) or
-            # NEVER STORED (rollout worker died / kv_put lost)? This single count says which.
-            n_cleared = sum(1 for k in missing if k in _CLEARED_KEYS)
-            logger.warning(
-                "[RESOLVE] %d/%d unique images missing from '%s' (was_cleared=%d never_stored=%d); "
-                "dropping %d/%d rows and continuing (e.g. %s)",
-                len(missing),
-                len({k for ids in image_ids_per_row for k in ids}),
-                partition,
-                n_cleared,
-                len(missing) - n_cleared,
-                n - len(keep),
-                n,
-                next(iter(missing)),
+            # Log the owning prompt uids of the missing images. Grep [CLEAR_IMAGES] in the driver log
+            # for these uids: if a uid appears there, its images WERE cleared (clear-path bug); if it
+            # never appears, the image was never stored. Cross-process root-cause signal (resolve runs
+            # in the worker, clear_images in the buffer/driver — both reach the same driver log).
+            missing_uids = sorted({k.split("_", 1)[0] for k in missing})
+            print(
+                f"[RESOLVE] {len(missing)}/{len({k for ids in image_ids_per_row for k in ids})} images "
+                f"missing from '{partition}'; dropping {n - len(keep)}/{n} rows and continuing. missing "
+                f"prompt uids (grep [CLEAR_IMAGES]): {missing_uids[:8]}",
+                flush=True,
             )
             if len(keep) < n:
                 if not keep:
@@ -524,10 +515,14 @@ def clear_images(image_keys, *, image_partition: str = PARTITION_IMAGES) -> None
     import transfer_queue as tq
 
     uniq = list(dict.fromkeys(image_keys))
-    # Record what we cleared (bounded FIFO) so resolve can attribute a later missing image to a
-    # clear-path bug vs a never-stored image.
-    for k in uniq:
-        _CLEARED_KEYS[k] = None
-    while len(_CLEARED_KEYS) > _CLEARED_KEYS_CAP:
-        _CLEARED_KEYS.popitem(last=False)
+    if _STEP_PROFILE:
+        # Log the prompt uids whose images we clear. clear_images runs in the buffer/driver process,
+        # so this reaches the driver log; cross-reference the uids with the worker-side [RESOLVE]
+        # "missing prompt uids" to see if a later-missing image was in fact cleared here (clear-path
+        # bug) or never present (never-stored). key = "{uid}_{session}_{sha1}", uid has no "_".
+        uids = sorted({k.split("_", 1)[0] for k in uniq})
+        print(
+            f"[CLEAR_IMAGES] cleared {len(uniq)} images / {len(uids)} prompts from '{image_partition}': {uids}",
+            flush=True,
+        )
     tq.kv_clear(keys=uniq, partition_id=image_partition)
