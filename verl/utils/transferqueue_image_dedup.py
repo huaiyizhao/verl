@@ -293,6 +293,38 @@ async def resolve_image_ids(
         value = value.data if isinstance(value, NonTensorData) else value
         image_ids_per_row.append(decode_image_ids(value))
 
+    # Defensive: a row may reference an image already gone from the store (a dedup-clear lifecycle
+    # race can remove a still-referenced image -> the storage-unit "key ... not found" that otherwise
+    # kills the whole run). Detect missing images up front and DROP the offending rows, so training
+    # continues on the rest instead of crashing. Logged so the frequency is visible.
+    existing = set(((tq.kv_list() or {}).get(partition) or {}).keys())
+    if existing:
+        missing = {k for ids in image_ids_per_row for k in ids if k not in existing}
+        if missing:
+            keep = [i for i, ids in enumerate(image_ids_per_row) if not any(k in missing for k in ids)]
+            logger.warning(
+                "[RESOLVE] dedup-clear race: %d/%d unique images missing from '%s'; dropping %d/%d rows "
+                "referencing them and continuing (e.g. %s)",
+                len(missing),
+                len({k for ids in image_ids_per_row for k in ids}),
+                partition,
+                n - len(keep),
+                n,
+                next(iter(missing)),
+            )
+            if len(keep) < n:
+                if not keep:
+                    # whole shard unusable — extremely unlikely; surface a clear error rather than
+                    # silently returning an empty batch (which would trip _balance_batch 0-items).
+                    raise RuntimeError(
+                        f"resolve_image_ids: ALL {n} rows reference missing images in '{partition}' "
+                        f"(dedup-clear race); cannot recover this batch."
+                    )
+                tensordict = tensordict[keep]
+                image_ids_per_row = [image_ids_per_row[i] for i in keep]
+                ids_col = tensordict.get(IMAGE_IDS_KEY)
+                n = len(keep)
+
     if _PROFILE and _RESOLVE_DBG[0] < 12:
         _RESOLVE_DBG[0] += 1
         import hashlib
