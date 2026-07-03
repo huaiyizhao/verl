@@ -72,6 +72,11 @@ logger = logging.getLogger(__name__)
 _PROFILE = os.getenv("VERL_PROFILE", "0") not in ("0", "false", "False", "")
 _STEP_PROFILE = _PROFILE or os.getenv("VERL_STEP_PROFILE", "0") not in ("0", "false", "False", "")
 _RESOLVE_DBG = [0]  # cap the per-row image_ids dump so it never floods the log
+# Bounded record of image keys this worker has cleared, so resolve can tell WHY a referenced image
+# is missing: if it's in here -> a clear-path bug (cleared while still referenced); if not -> the
+# image was never stored (rollout worker died / kv_put lost). Definitively categorizes the crash.
+_CLEARED_KEYS: "OrderedDict[str, None]" = OrderedDict()
+_CLEARED_KEYS_CAP = 400000
 
 # Separate TQ partitions for deduped image payloads (train / validation kept
 # apart so val GC never deletes a train image and vice-versa).
@@ -302,12 +307,17 @@ async def resolve_image_ids(
         missing = {k for ids in image_ids_per_row for k in ids if k not in existing}
         if missing:
             keep = [i for i, ids in enumerate(image_ids_per_row) if not any(k in missing for k in ids)]
+            # ROOT-CAUSE tag: was each missing image CLEARED by this worker (clear-path bug) or
+            # NEVER STORED (rollout worker died / kv_put lost)? This single count says which.
+            n_cleared = sum(1 for k in missing if k in _CLEARED_KEYS)
             logger.warning(
-                "[RESOLVE] dedup-clear race: %d/%d unique images missing from '%s'; dropping %d/%d rows "
-                "referencing them and continuing (e.g. %s)",
+                "[RESOLVE] %d/%d unique images missing from '%s' (was_cleared=%d never_stored=%d); "
+                "dropping %d/%d rows and continuing (e.g. %s)",
                 len(missing),
                 len({k for ids in image_ids_per_row for k in ids}),
                 partition,
+                n_cleared,
+                len(missing) - n_cleared,
                 n - len(keep),
                 n,
                 next(iter(missing)),
@@ -513,4 +523,11 @@ def clear_images(image_keys, *, image_partition: str = PARTITION_IMAGES) -> None
         return
     import transfer_queue as tq
 
-    tq.kv_clear(keys=list(dict.fromkeys(image_keys)), partition_id=image_partition)
+    uniq = list(dict.fromkeys(image_keys))
+    # Record what we cleared (bounded FIFO) so resolve can attribute a later missing image to a
+    # clear-path bug vs a never-stored image.
+    for k in uniq:
+        _CLEARED_KEYS[k] = None
+    while len(_CLEARED_KEYS) > _CLEARED_KEYS_CAP:
+        _CLEARED_KEYS.popitem(last=False)
+    tq.kv_clear(keys=uniq, partition_id=image_partition)
