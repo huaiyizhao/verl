@@ -433,8 +433,14 @@ class AgentLoopBase(ABC):
         prompt_length = self.rollout_config.prompt_length
         if len(prompt_ids) > prompt_length:
             if images or videos or audios:
+                # n_images tells us WHY it overflowed: small (<= the context window, ~3-4) => the
+                # screenshots are simply high-resolution (many tokens each -> cap max_pixels); large
+                # => the sliding window is not being applied to the rollout prompt.
+                n_img = len(images) if images else 0
+                per_img = f", ~{len(prompt_ids) // n_img} tok/image" if n_img else ""
                 raise ValueError(
-                    f"Multimodal prompt produced {len(prompt_ids)} tokens, exceeding "
+                    f"Multimodal prompt produced {len(prompt_ids)} tokens "
+                    f"({n_img} images, {len(videos) if videos else 0} videos{per_img}), exceeding "
                     f"rollout.prompt_length={prompt_length}. Truncating multimodal token "
                     f"sequences corrupts vision/audio feature alignment, so this is treated "
                     f"as a configuration error. Reduce the multimodal input size "
