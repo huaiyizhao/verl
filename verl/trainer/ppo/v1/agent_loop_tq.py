@@ -20,6 +20,7 @@ import logging
 import os
 from typing import Any
 
+import numpy as np
 import ray
 import torch
 import transfer_queue as tq
@@ -32,6 +33,7 @@ from verl.experimental.agent_loop import (
     get_trajectory_info,
 )
 from verl.utils.ray_utils import auto_await
+from verl.utils.rollout_trace import RolloutTraceConfig
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 
 logger = logging.getLogger(__name__)
@@ -50,6 +52,31 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
         super().__init__(*args, **kwargs)
         tq.init()
         self.background_tasks = set()
+
+    def _select_traced_indices(self, batch: TensorDict) -> set[int]:
+        """Return the row indices in ``batch`` that should be traced.
+
+        Selection is per-worker and keyed on the dataset sample id (``index``),
+        so all ``rollout.n`` sessions of a chosen sample are traced together.
+        Returns an empty set when tracing is disabled (no backend configured).
+        """
+        if RolloutTraceConfig.get_backend() is None:
+            return set()
+
+        n = len(batch)
+        max_samples = RolloutTraceConfig.get_instance().max_samples_per_step_per_worker
+        if max_samples is None:
+            return set(range(n))
+
+        raw_index = batch["index"]
+        index_vals = [raw_index[i].item() if hasattr(raw_index[i], "item") else raw_index[i] for i in range(n)]
+        unique_vals = list(dict.fromkeys(index_vals))
+        if max_samples >= len(unique_vals):
+            return set(range(n))
+
+        chosen_positions = np.random.choice(len(unique_vals), max_samples, replace=False).tolist()
+        selected_vals = {unique_vals[p] for p in chosen_positions}
+        return {i for i in range(n) if index_vals[i] in selected_vals}
 
     async def generate_sequences(self, batch: TensorDict) -> None:
         """Spawn agent loop for each sample in the batch without waiting for the results."""
@@ -77,10 +104,16 @@ class AgentLoopWorkerTQ(AgentLoopWorker):
 
         trajectory_info = await get_trajectory_info(batch["global_steps"], batch["index"], validate)
 
+        # Decide which samples to trace this batch. Mirrors AgentLoopWorker in
+        # verl/experimental/agent_loop/agent_loop.py: select up to
+        # `max_samples_per_step_per_worker` unique dataset samples per worker per
+        # step (all `rollout.n` sessions of a selected sample are traced). None =>
+        # trace every sample.
+        traced_indices = self._select_traced_indices(batch)
+
         # create background tasks for each sample in the batch
         for i in range(len(batch)):
-            # TODO(wuxibin): add trace support
-            trace_this_sample = False
+            trace_this_sample = i in traced_indices
             prompt = {}
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):

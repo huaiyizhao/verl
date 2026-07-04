@@ -34,6 +34,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+import numpy as np
 import ray
 import torch
 import transfer_queue as tq
@@ -46,6 +47,7 @@ from verl.experimental.agent_loop import (
 )
 from verl.trainer.ppo.v1.agent_loop_tq import apply_greedy_sampling_params
 from verl.utils.ray_utils import auto_await
+from verl.utils.rollout_trace import RolloutTraceConfig
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 from verl.utils.tokenizer import get_processor_token_id
 
@@ -105,6 +107,33 @@ def build_trajectory_info(step, index, validate) -> list[dict]:
             rollout_n = 0
         trajectory_info.append({"step": step, "sample_index": index[i], "rollout_n": rollout_n, "validate": validate})
     return trajectory_info
+
+
+def _select_traced_rows(prompts: TensorDict) -> set[int]:
+    """Return the prompt-row indices to trace this dispatch (rollout-level manager).
+
+    Keyed on the dataset sample id (``index``) so every session of a chosen prompt is traced.
+    Returns an empty set when no trace backend is configured, and every row when
+    ``max_samples_per_step_per_worker`` is ``None``. Otherwise up to that many unique samples
+    are drawn per dispatch; total traced sessions = selected_samples * rollout.n.
+    """
+    if RolloutTraceConfig.get_backend() is None:
+        return set()
+
+    n_rows = len(prompts)
+    max_samples = RolloutTraceConfig.get_instance().max_samples_per_step_per_worker
+    if max_samples is None:
+        return set(range(n_rows))
+
+    raw_index = prompts["index"]
+    index_vals = [raw_index[i].item() if hasattr(raw_index[i], "item") else raw_index[i] for i in range(n_rows)]
+    unique_vals = list(dict.fromkeys(index_vals))
+    if max_samples >= len(unique_vals):
+        return set(range(n_rows))
+
+    chosen = np.random.choice(len(unique_vals), max_samples, replace=False).tolist()
+    selected_vals = {unique_vals[p] for p in chosen}
+    return {i for i in range(n_rows) if index_vals[i] in selected_vals}
 
 
 def extract_sample(batch: TensorDict, i: int) -> dict:
@@ -171,19 +200,24 @@ class RolloutAgentLoopWorkerTQ(AgentLoopWorker):
             self._sem = asyncio.Semaphore(self._rollout_cap)
         return self._sem
 
-    async def run_rollout(self, prompt: dict, sampling_params: dict, trajectory: dict, session_id: int) -> None:
+    async def run_rollout(
+        self, prompt: dict, sampling_params: dict, trajectory: dict, session_id: int, trace: bool = False
+    ) -> None:
         """Schedule a single rollout as a background task and return immediately.
 
         The fast return lets the manager's dispatch loop ack all units without blocking on
         rollout execution, while still surfacing a dead worker to the manager (the ``.remote``
         call fails). ``prompt`` must already have ``__rollout_n__`` / ``__do_sample__`` removed
-        by the manager; ``agent_name`` stays in it (consumed by ``_run_agent_loop``).
+        by the manager; ``agent_name`` stays in it (consumed by ``_run_agent_loop``). ``trace``
+        is set by the manager for the sampled prompts (see ``max_samples_per_step_per_worker``).
         """
-        task = asyncio.create_task(self._execute_rollout(prompt, sampling_params, trajectory, session_id))
+        task = asyncio.create_task(self._execute_rollout(prompt, sampling_params, trajectory, session_id, trace))
         self.background_tasks.add(task)
         task.add_done_callback(self.background_tasks.discard)
 
-    async def _execute_rollout(self, prompt: dict, sampling_params: dict, trajectory: dict, session_id: int) -> None:
+    async def _execute_rollout(
+        self, prompt: dict, sampling_params: dict, trajectory: dict, session_id: int, trace: bool = False
+    ) -> None:
         uid = prompt["uid"]
         partition_id = "train" if not trajectory["validate"] else "val"
         sem = self._semaphore()
@@ -192,11 +226,11 @@ class RolloutAgentLoopWorkerTQ(AgentLoopWorker):
             if sem is not None:
                 async with sem:
                     await self._run_agent_loop(
-                        sampling_params, trajectory=trajectory, trace=False, session_id=session_id, **prompt
+                        sampling_params, trajectory=trajectory, trace=trace, session_id=session_id, **prompt
                     )
             else:
                 await self._run_agent_loop(
-                    sampling_params, trajectory=trajectory, trace=False, session_id=session_id, **prompt
+                    sampling_params, trajectory=trajectory, trace=trace, session_id=session_id, **prompt
                 )
         except Exception as e:
             logger.exception(f"Error in rollout {uid}_sess{session_id}: {e}")
@@ -399,6 +433,11 @@ class RolloutAgentLoopManagerTQ(AgentLoopManager):
 
         trajectory_info = build_trajectory_info(prompts["global_steps"], prompts["index"], validate)
 
+        # Pick which prompts to trace this step. All `n` GRPO sessions of a chosen prompt are
+        # traced together (so their rollouts can be compared in the trace UI). See
+        # `_select_traced_rows`; `max_samples_per_step_per_worker=None` traces everything.
+        traced_rows = _select_traced_rows(prompts)
+
         num_workers = len(self.agent_loop_workers)
         futures = []
         for i in range(len(prompts)):
@@ -410,13 +449,16 @@ class RolloutAgentLoopManagerTQ(AgentLoopManager):
             sampling_params = dict(base_sampling_params)
             if not validate and not do_sample:
                 apply_greedy_sampling_params(sampling_params)
+            trace_this = i in traced_rows
 
             # TODO(perf): a prompt is currently re-serialized once per session; batch sessions
             # by target worker to send it at most once per worker when n > num_workers.
             for session_id in range(int(n)):
                 worker = self.agent_loop_workers[self._dispatch_rr % num_workers]
                 self._dispatch_rr += 1
-                futures.append(worker.run_rollout.remote(prompt, sampling_params, trajectory_info[i], session_id))
+                futures.append(
+                    worker.run_rollout.remote(prompt, sampling_params, trajectory_info[i], session_id, trace_this)
+                )
 
         # Wait only for the fast dispatch acks (surfaces a dead worker; does not block on rollout
         # execution, which proceeds as background tasks on the workers).
