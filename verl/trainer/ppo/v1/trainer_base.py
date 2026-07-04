@@ -1347,6 +1347,51 @@ class PPOTrainer(ABC):
         else:
             data.batch["token_level_rewards"] = data.batch["token_level_scores"]
 
+        # 1b. GRPO group-quality metrics. A group = one prompt (uid); its members are the rollout
+        # sessions (dedup turn-rows, which all share their session's reward). Two views:
+        #   - equal_reward_groups: reward variance == 0 -> advantage 0 -> NO gradient (pure waste).
+        #     Includes all-fail groups AND all-success groups whose rewards happen to be identical.
+        #   - outcome breakdown by base success (reward > 0): groups_all_fail / all_success / mixed.
+        #     Only "mixed" groups carry within-group reward variance, i.e. actually produce gradient.
+        with torch.no_grad():
+            group_scores = data.batch["token_level_rewards"].sum(dim=-1)
+            # dedup turn-rows -> per-session reward, keyed {uid}_{session_id}; group sessions by uid.
+            session_reward: dict[str, float] = {}
+            session_uid: dict[str, Any] = {}
+            for i, key in enumerate(batch.keys):
+                uid, session_id, _ = key.rsplit("_", 2)
+                skey = f"{uid}_{session_id}"
+                session_reward[skey] = float(group_scores[i].item())  # rows of a session share reward
+                session_uid[skey] = uid
+            uid2rewards: dict[Any, list] = defaultdict(list)
+            for skey, r in session_reward.items():
+                uid2rewards[session_uid[skey]].append(r)
+
+            n_groups = len(uid2rewards)
+            n_equal = n_all_fail = n_all_success = n_mixed = 0
+            success_rates = []
+            for rewards in uid2rewards.values():
+                lo, hi = min(rewards), max(rewards)
+                if hi - lo <= 1e-8:
+                    n_equal += 1
+                n_succ = sum(1 for r in rewards if r > 1e-6)
+                success_rates.append(n_succ / len(rewards))
+                if n_succ == 0:
+                    n_all_fail += 1
+                elif n_succ == len(rewards):
+                    n_all_success += 1
+                else:
+                    n_mixed += 1
+            denom = max(n_groups, 1)
+            metrics["critic/grpo/num_prompt_groups"] = float(n_groups)
+            metrics["critic/grpo/equal_reward_groups"] = float(n_equal)
+            metrics["critic/grpo/equal_reward_group_frac"] = float(n_equal) / denom
+            metrics["critic/grpo/groups_all_fail"] = float(n_all_fail)
+            metrics["critic/grpo/groups_all_success"] = float(n_all_success)
+            metrics["critic/grpo/groups_mixed"] = float(n_mixed)
+            metrics["critic/grpo/groups_mixed_frac"] = float(n_mixed) / denom
+            metrics["critic/grpo/session_success_rate"] = float(sum(success_rates)) / denom
+
         # 2. Compute rollout correction: IS weights, rejection sampling, and metrics
         # Only runs in decoupled mode (computes once per batch using stable π_old)
         # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
