@@ -173,6 +173,64 @@ def _mm_rowcheck(data, module, where: str) -> None:
         print(f"[MM_ROWCHECK] check failed: {e!r}", flush=True)
 
 
+# One-shot root-cause probe: dump a single real micro-batch (inputs + vLLM logp + FSDP logp) to
+# disk so the vLLM<->FSDP logprob divergence can be localized OFFLINE (mrope position_ids diff,
+# vision-embed diff, fp32/bf16/eager forks, vLLM three-way) WITHOUT another training run or any
+# risk to the live forward. Analyzer: recipe/fully_async_gui_agent/logprob_rootcause_probe.py.
+_LOGPROB_PROBE_DONE = [0]
+
+
+def _maybe_dump_logprob_probe(micro_batch, model_output) -> None:
+    if os.getenv("VERL_LOGPROB_PROBE_DUMP", "0") in ("0", "false", "False", ""):
+        return
+    cap = int(os.getenv("VERL_LOGPROB_PROBE_MAX", "1"))
+    if _LOGPROB_PROBE_DONE[0] >= cap:
+        return
+    try:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    except Exception:  # noqa: BLE001
+        rank = 0
+    if rank != 0:
+        return
+    try:
+
+        def _unnest(x):
+            # Convert a (possibly nested / DTensor) tensor to a plain CPU tensor + optional offsets.
+            if x is None:
+                return None
+            if hasattr(x, "offsets") and callable(getattr(x, "offsets", None)):
+                try:
+                    return {"values": x.values().detach().cpu(), "offsets": x.offsets().detach().cpu()}
+                except Exception:  # noqa: BLE001
+                    pass
+            if torch.is_tensor(x):
+                return x.detach().cpu()
+            return x
+
+        mm = extract_multi_modal_inputs(micro_batch.get("multi_modal_inputs", []))
+        bundle = {
+            "input_ids": _unnest(micro_batch.get("input_ids")),
+            "position_ids": _unnest(micro_batch.get("position_ids")),
+            "responses": _unnest(micro_batch.get("responses")),
+            "response_mask": _unnest(micro_batch.get("response_mask")),
+            "old_log_probs": _unnest(micro_batch.get("old_log_probs")),  # vLLM logp (bypass_mode)
+            "rollout_log_probs": _unnest(micro_batch.get("rollout_log_probs")),
+            "temperature": _unnest(micro_batch.get("temperature")),
+            "fsdp_log_probs": _unnest(model_output.get("log_probs")) if isinstance(model_output, dict) else None,
+            "pixel_values": _unnest(mm.get("pixel_values")) if mm else None,
+            "image_grid_thw": _unnest(mm.get("image_grid_thw")) if mm else None,
+            "model_path": os.getenv("VERL_LOGPROB_DEBUG_TOKENIZER", ""),
+        }
+        out_dir = os.getenv("VERL_LOGPROB_PROBE_DIR", "/tmp/logprob_probe")
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, f"probe_rank{rank}_{_LOGPROB_PROBE_DONE[0]}.pt")
+        torch.save(bundle, path)
+        _LOGPROB_PROBE_DONE[0] += 1
+        print(f"[LOGPROB_PROBE] dumped micro-batch bundle -> {path} (run the offline analyzer on it)", flush=True)
+    except Exception as e:  # noqa: BLE001 - probe must never break training
+        print(f"[LOGPROB_PROBE] dump failed: {e!r}", flush=True)
+
+
 device_name = get_device_name()
 
 
@@ -1484,6 +1542,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
             model_output = self.prepare_model_outputs(
                 output=raw_output, output_args=output_args, micro_batch=micro_batch, logits_processor_func=loss_function
             )
+
+            _maybe_dump_logprob_probe(micro_batch, model_output)
 
             if loss_function is not None:
                 loss, metrics = loss_function(

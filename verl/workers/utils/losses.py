@@ -18,7 +18,13 @@ import os
 import torch
 from tensordict import TensorDict
 
-from verl.trainer.ppo.core_algos import agg_loss, compute_value_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import (
+    agg_loss,
+    compute_value_loss,
+    get_policy_loss_fn,
+    kl_penalty,
+    set_lp_debug_responses,
+)
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.metric import AggregationType, Metric
@@ -102,7 +108,8 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         fields.append("responses")
     data = data.select(*fields).to_padded_tensor()
     if _lp_debug:
-        config.global_batch_info["_lp_debug_responses"] = data["responses"]
+        # Stash as a module global (NOT global_batch_info, which is **-splatted into agg_loss).
+        set_lp_debug_responses(data["responses"])
 
     response_mask = data["response_mask"].to(bool)
     # compute policy loss

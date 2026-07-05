@@ -20,6 +20,7 @@ implement PPO-like algorithms.
 
 __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 
+import math
 import os
 from collections import defaultdict
 from enum import Enum
@@ -1396,6 +1397,28 @@ def compute_policy_loss_vanilla(
         "actor/ppo_kl": ppo_kl.detach().item(),
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
     }
+    # Entropy-drift diagnostic: does the train/infer ratio bias + PPO clip asymmetrically strip the
+    # SHARPENING gradient (A>0, upper-clipped -> 0) while amplifying the FLATTENING one (A<0, r>1)?
+    # If so, entropy is pushed up preferentially at high-entropy ("uncertain") tokens. Gated by env.
+    if os.getenv("VERL_LOGPROB_DEBUG", "1") not in ("0", "false", "False", ""):
+        with torch.no_grad():
+            m = response_mask.bool()
+            unc = (old_log_prob.abs() > 1.0) & m  # sampled-token prob << 1 => high-entropy position
+            pos_unc = (advantages > 0) & unc
+            neg_unc = (advantages < 0) & unc
+            hi = 1.0 + (cliprange_high if cliprange_high is not None else cliprange)
+            n_pos, n_neg = int(pos_unc.sum()), int(neg_unc.sum())
+            pg_metrics.update(
+                {
+                    # sharpening thrown away: A>0 uncertain tokens upper-clipped (ratio>1+hi) -> 0 grad
+                    "dbg/pos_unc_upperclip_frac": ((pos_unc & (ratio > hi)).sum().item() / n_pos if n_pos else 0.0),
+                    # flattening amplified: A<0 uncertain tokens with ratio>1 -> full r*|A| down-push
+                    "dbg/neg_unc_amplified_frac": ((neg_unc & (ratio > 1.0)).sum().item() / n_neg if n_neg else 0.0),
+                    "dbg/ratio_pos_unc": ratio[pos_unc].mean().item() if n_pos else float("nan"),
+                    "dbg/ratio_neg_unc": ratio[neg_unc].mean().item() if n_neg else float("nan"),
+                    "dbg/frac_uncertain": (unc.sum().float() / m.sum().clamp(min=1)).item(),
+                }
+            )
     return pg_loss, pg_metrics
 
 
@@ -2388,6 +2411,55 @@ def compute_policy_loss_reinforce(
 # The gap is measured over RESPONSE tokens (model-generated text), before rejection masking.
 _LOGPROB_DEBUG_COUNT = 0
 _LOGPROB_DEBUG_MAX = int(os.getenv("VERL_LOGPROB_DEBUG_MAX", "40"))
+# Padded response token-ids for the current micro-batch, stashed by losses.ppo_loss so the
+# WORST_TOKEN diagnostic can name the divergent token. Kept as a module global (NOT in
+# config.global_batch_info) because that dict is **-splatted into agg_loss(), which rejects
+# unknown kwargs. Per-process sequential forward, so a plain global is safe.
+_LP_DEBUG_RESPONSES = None
+
+
+def set_lp_debug_responses(responses):
+    """Stash padded response ids for the LOGPROB_GAP WORST_TOKEN diagnostic (see above)."""
+    global _LP_DEBUG_RESPONSES
+    _LP_DEBUG_RESPONSES = responses
+
+
+# Lazily-loaded tokenizer so the LOGPROB_GAP dump can print DECODED text inline (no separate
+# on-box decode step). Path comes from env VERL_LOGPROB_DEBUG_TOKENIZER (set to the model dir).
+# Loaded once per worker process, cached; degrades to ids-only if unset/unavailable.
+_LP_DEBUG_TOKENIZER = None
+_LP_DEBUG_TOKENIZER_TRIED = False
+
+
+def _get_lp_debug_tokenizer():
+    global _LP_DEBUG_TOKENIZER, _LP_DEBUG_TOKENIZER_TRIED
+    if _LP_DEBUG_TOKENIZER_TRIED:
+        return _LP_DEBUG_TOKENIZER
+    _LP_DEBUG_TOKENIZER_TRIED = True
+    path = os.getenv("VERL_LOGPROB_DEBUG_TOKENIZER", "")
+    if not path:
+        return None
+    try:
+        from transformers import AutoTokenizer
+
+        _LP_DEBUG_TOKENIZER = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
+        print(f"[LOGPROB_GAP] decode tokenizer loaded from {path}", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[LOGPROB_GAP] tokenizer load failed ({e!r}); printing ids only", flush=True)
+        _LP_DEBUG_TOKENIZER = None
+    return _LP_DEBUG_TOKENIZER
+
+
+def _lp_decode(tok, ids):
+    """Decode a single id or a list of ids to text; '' on any failure."""
+    if tok is None:
+        return ""
+    try:
+        if isinstance(ids, int):
+            ids = [ids]
+        return tok.decode([int(i) for i in ids])
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _lin_slope(x: torch.Tensor, y: torch.Tensor) -> float:
@@ -2465,33 +2537,44 @@ def _maybe_debug_logprob_gap(
             f"| temp_slope={temp_slope:+.4f} pos_slope={pos_slope:+.6f} pos0_d={pos0_d:+.5f} rest_d={rest_d:+.5f}",
             flush=True,
         )
-        # per-token dump for the first valid sequence (v=vLLM, f=FSDP, d=FSDP-vLLM)
+        # per-token dump for the first valid sequence (v=vLLM, f=FSDP, d=FSDP-vLLM), with the
+        # decoded token text inline so we can see WHICH tokens diverge (action verbs? coords?).
+        responses = _LP_DEBUG_RESPONSES
+        tok = _get_lp_debug_tokenizer()
         si = int((mask.sum(-1) > 0).float().argmax().item())
         cols = mask[si].nonzero(as_tuple=True)[0][:40].tolist()
         toks = []
         for c in cols:
             v = rollout_log_prob[si, c].item()
             fp = log_prob[si, c].item()
-            toks.append(f"{c}:v{v:+.3f}/f{fp:+.3f}/d{fp - v:+.3f}")
-        print(f"[LOGPROB_GAP] seq{si} pos:vLLM/FSDP/diff -> " + " ".join(toks), flush=True)
+            txt = ""
+            if responses is not None and si < responses.shape[0] and c < responses.shape[1]:
+                txt = _lp_decode(tok, int(responses[si, c].item()))
+            toks.append(f"{c}:{txt!r}:v{v:+.2f}/f{fp:+.2f}/d{fp - v:+.2f}")
+        print(f"[LOGPROB_GAP] seq{si} pos:text:vLLM/FSDP/diff -> " + " ".join(toks), flush=True)
+        # full decoded response text for that sequence (context for the per-token dump).
+        if responses is not None and tok is not None:
+            allcols = mask[si].nonzero(as_tuple=True)[0].tolist()
+            full_ids = [int(responses[si, c].item()) for c in allcols]
+            print(f"[LOGPROB_GAP] seq{si} response_text={_lp_decode(tok, full_ids)!r}", flush=True)
 
         # Name the single worst-divergence token in this micro-batch (the token that dominates the
-        # k3 that drives masking). Logs its response-token id + neighbors so it can be decoded on the
-        # box (tokenizer isn't available here). responses[r] aligns with response_mask[r].
-        responses = None
-        if config is not None:
-            gbi = getattr(config, "global_batch_info", None)
-            responses = gbi.get("_lp_debug_responses") if isinstance(gbi, dict) else None
+        # k3 that drives masking) and DECODE it + its neighbourhood inline. responses[r] aligns with
+        # response_mask[r]. p_vLLM/p_FSDP are the softmax probs the two engines assign this token.
         flat_idx = int(token_k3_full.argmax().item())
         r, p = divmod(flat_idx, token_k3_full.shape[1])
+        v_lp, f_lp = rollout_log_prob[r, p].item(), log_prob[r, p].item()
         worst = (
             f"[LOGPROB_GAP] WORST_TOKEN row={r} pos={p} k3={token_k3_full[r, p].item():.4f} "
-            f"vLLM={rollout_log_prob[r, p].item():+.4f} FSDP={log_prob[r, p].item():+.4f}"
+            f"vLLM={v_lp:+.4f}(p={math.exp(v_lp):.3f}) FSDP={f_lp:+.4f}(p={math.exp(f_lp):.3f})"
         )
         if responses is not None and r < responses.shape[0] and p < responses.shape[1]:
-            lo, hi = max(0, p - 3), min(responses.shape[1], p + 4)
+            lo, hi = max(0, p - 5), min(responses.shape[1], p + 6)
             window = responses[r, lo:hi].tolist()
-            worst += f" token_id={int(responses[r, p].item())} window_ids[{lo}:{hi}]={window}"
+            worst += (
+                f" token={_lp_decode(tok, int(responses[r, p].item()))!r} token_id={int(responses[r, p].item())}"
+                f" context={_lp_decode(tok, window)!r}"
+            )
         print(worst, flush=True)
 
 
