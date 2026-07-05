@@ -1402,23 +1402,50 @@ def compute_policy_loss_vanilla(
     # If so, entropy is pushed up preferentially at high-entropy ("uncertain") tokens. Gated by env.
     if os.getenv("VERL_LOGPROB_DEBUG", "1") not in ("0", "false", "False", ""):
         with torch.no_grad():
+            # |logp|>thr => "uncertain" (sampled-token prob < e^-thr). Loosened default 0.5 (p<0.61)
+            # because >1.0 caught only ~1.5% of tokens. Tunable via VERL_LPDBG_UNC_THRESH.
+            thr = float(os.getenv("VERL_LPDBG_UNC_THRESH", "0.5"))
             m = response_mask.bool()
-            unc = (old_log_prob.abs() > 1.0) & m  # sampled-token prob << 1 => high-entropy position
+            unc = (old_log_prob.abs() > thr) & m
             pos_unc = (advantages > 0) & unc
             neg_unc = (advantages < 0) & unc
             hi = 1.0 + (cliprange_high if cliprange_high is not None else cliprange)
-            n_pos, n_neg = int(pos_unc.sum()), int(neg_unc.sum())
+            # Accumulate ACROSS micro-batches (module global, per process): a single micro-batch often
+            # has n_pos or n_neg == 0 (GRPO advantage is per-session, one sign per group) -> per-batch
+            # fractions were nan. Running totals never nan once any uncertain token is seen.
+            acc = _ENTROPY_ASYM_ACC
+            acc["pos_unc"] += int(pos_unc.sum())
+            acc["neg_unc"] += int(neg_unc.sum())
+            acc["pos_unc_uclip"] += int((pos_unc & (ratio > hi)).sum())  # A>0 uncertain upper-clipped -> 0 grad
+            acc["neg_unc_ampl"] += int((neg_unc & (ratio > 1.0)).sum())  # A<0 uncertain, ratio>1 -> amplified
+            acc["ratio_pos_sum"] += float(ratio[pos_unc].sum())
+            acc["ratio_neg_sum"] += float(ratio[neg_unc].sum())
+            acc["unc"] += int(unc.sum())
+            acc["valid"] += int(m.sum())
+            acc["calls"] += 1
+            npos, nneg, nval = max(1, acc["pos_unc"]), max(1, acc["neg_unc"]), max(1, acc["valid"])
             pg_metrics.update(
                 {
-                    # sharpening thrown away: A>0 uncertain tokens upper-clipped (ratio>1+hi) -> 0 grad
-                    "dbg/pos_unc_upperclip_frac": ((pos_unc & (ratio > hi)).sum().item() / n_pos if n_pos else 0.0),
-                    # flattening amplified: A<0 uncertain tokens with ratio>1 -> full r*|A| down-push
-                    "dbg/neg_unc_amplified_frac": ((neg_unc & (ratio > 1.0)).sum().item() / n_neg if n_neg else 0.0),
-                    "dbg/ratio_pos_unc": ratio[pos_unc].mean().item() if n_pos else float("nan"),
-                    "dbg/ratio_neg_unc": ratio[neg_unc].mean().item() if n_neg else float("nan"),
-                    "dbg/frac_uncertain": (unc.sum().float() / m.sum().clamp(min=1)).item(),
+                    "dbg/pos_unc_upperclip_frac": acc["pos_unc_uclip"] / npos,
+                    "dbg/neg_unc_amplified_frac": acc["neg_unc_ampl"] / nneg,
+                    "dbg/ratio_pos_unc": acc["ratio_pos_sum"] / npos,
+                    "dbg/ratio_neg_unc": acc["ratio_neg_sum"] / nneg,
+                    "dbg/frac_uncertain": acc["unc"] / nval,
                 }
             )
+            try:
+                _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            except Exception:  # noqa: BLE001
+                _rank = 0
+            if _rank == 0 and acc["calls"] % int(os.getenv("VERL_LPDBG_PRINT_EVERY", "20")) == 0:
+                print(
+                    f"[ENTROPY_ASYM] calls={acc['calls']} frac_unc={acc['unc'] / nval:.3f} "
+                    f"pos_unc={acc['pos_unc']} neg_unc={acc['neg_unc']} "
+                    f"upperclip(pos_unc)={acc['pos_unc_uclip'] / npos:.3f} "
+                    f"amplified(neg_unc)={acc['neg_unc_ampl'] / nneg:.3f} "
+                    f"ratio_pos_unc={acc['ratio_pos_sum'] / npos:.3f} ratio_neg_unc={acc['ratio_neg_sum'] / nneg:.3f}",
+                    flush=True,
+                )
     return pg_loss, pg_metrics
 
 
@@ -2411,6 +2438,20 @@ def compute_policy_loss_reinforce(
 # The gap is measured over RESPONSE tokens (model-generated text), before rejection masking.
 _LOGPROB_DEBUG_COUNT = 0
 _LOGPROB_DEBUG_MAX = int(os.getenv("VERL_LOGPROB_DEBUG_MAX", "40"))
+# Running (cross-micro-batch, per-process) accumulator for the entropy-asymmetry diagnostic in
+# compute_policy_loss_vanilla. Per-batch fractions are nan-prone (GRPO gives one advantage sign per
+# group -> n_pos or n_neg == 0), so we sum counts here and report running fractions.
+_ENTROPY_ASYM_ACC = {
+    "pos_unc": 0,
+    "neg_unc": 0,
+    "pos_unc_uclip": 0,
+    "neg_unc_ampl": 0,
+    "ratio_pos_sum": 0.0,
+    "ratio_neg_sum": 0.0,
+    "unc": 0,
+    "valid": 0,
+    "calls": 0,
+}
 # Padded response token-ids for the current micro-batch, stashed by losses.ppo_loss so the
 # WORST_TOKEN diagnostic can name the divergent token. Kept as a module global (NOT in
 # config.global_batch_info) because that dict is **-splatted into agg_loss(), which rejects
