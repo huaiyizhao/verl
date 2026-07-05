@@ -2436,13 +2436,31 @@ def _maybe_debug_logprob_gap(rollout_log_prob: torch.Tensor, log_prob: torch.Ten
         rest_d = vd[~first].mean().item() if bool((~first).any()) else float("nan")
         pos_slope = _lin_slope(pos_v, vd)
 
+        # k3 divergence (what the rejection mask thresholds on) + how concentrated it is.
+        # token_k3 = exp(d) - 1 - d. If a single token contributes most of a sequence's k3, then a
+        # short response is masked by ONE outlier (per-seq top1_k3_share -> 1.0).
+        token_k3_full = (torch.exp(diff.clamp(-20, 20)) - 1.0 - diff) * mask
+        seq_k3_sum = token_k3_full.sum(dim=1)
+        seq_k3_max = token_k3_full.max(dim=1).values
+        seq_len = mask.sum(dim=1).clamp(min=1)
+        seq_valid = mask.sum(dim=1) > 0
+        seq_mean_k3 = (seq_k3_sum / seq_len)[seq_valid]
+        top1_share = (seq_k3_max / seq_k3_sum.clamp(min=1e-9))[seq_valid & (seq_k3_sum > 1e-9)]
+        frac_seq_over_thr = (seq_mean_k3 > 0.005).float().mean().item() if seq_mean_k3.numel() else 0.0
+        # gap split by token uncertainty (|rollout logprob|): confident (~prob 1) vs uncertain.
+        conf = vroll.abs() < 0.1
+        unc = vroll.abs() > 1.0
+        conf_abs_d = abs_d[conf].mean().item() if bool(conf.any()) else 0.0
+        unc_abs_d = abs_d[unc].mean().item() if bool(unc.any()) else 0.0
         print(
             f"[LOGPROB_GAP] call#{_LOGPROB_DEBUG_COUNT} valid_tok={vd.numel()} "
             f"mean_signed_d={vd.mean().item():+.5f} mean_abs_d={abs_d.mean().item():.5f} "
             f"max_abs_d={abs_d.max().item():.5f} std_d={vd.std().item():.5f} "
             f"frac>0.05={(abs_d > 0.05).float().mean().item():.3f} frac>0.1={(abs_d > 0.1).float().mean().item():.3f} "
-            f"| temp_slope={temp_slope:+.4f} pos_slope={pos_slope:+.6f} "
-            f"pos0_d={pos0_d:+.5f} rest_d={rest_d:+.5f}",
+            f"| seq_mean_k3={seq_mean_k3.mean().item():.5f} seq_masked@0.005={frac_seq_over_thr:.3f} "
+            f"top1_k3_share={top1_share.mean().item() if top1_share.numel() else 0.0:.3f} "
+            f"| abs_d[confident]={conf_abs_d:.5f} abs_d[uncertain]={unc_abs_d:.5f} "
+            f"| temp_slope={temp_slope:+.4f} pos_slope={pos_slope:+.6f} pos0_d={pos0_d:+.5f} rest_d={rest_d:+.5f}",
             flush=True,
         )
         # per-token dump for the first valid sequence (v=vLLM, f=FSDP, d=FSDP-vLLM)

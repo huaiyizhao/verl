@@ -47,7 +47,6 @@ from verl.experimental.agent_loop import (
 )
 from verl.trainer.ppo.v1.agent_loop_tq import apply_greedy_sampling_params
 from verl.utils.ray_utils import auto_await
-from verl.utils.rollout_trace import RolloutTraceConfig
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 from verl.utils.tokenizer import get_processor_token_id
 
@@ -109,19 +108,25 @@ def build_trajectory_info(step, index, validate) -> list[dict]:
     return trajectory_info
 
 
-def _select_traced_rows(prompts: TensorDict) -> set[int]:
+def _select_traced_rows(prompts: TensorDict, trace_cfg) -> set[int]:
     """Return the prompt-row indices to trace this dispatch (rollout-level manager).
 
     Keyed on the dataset sample id (``index``) so every session of a chosen prompt is traced.
     Returns an empty set when no trace backend is configured, and every row when
     ``max_samples_per_step_per_worker`` is ``None``. Otherwise up to that many unique samples
     are drawn per dispatch; total traced sessions = selected_samples * rollout.n.
+
+    NOTE: reads ``backend`` / ``max_samples_per_step_per_worker`` from the config directly, NOT
+    from the ``RolloutTraceConfig`` singleton — that singleton is initialized in the *worker*
+    ``__init__`` (AgentLoopWorker) and is therefore uninitialized (backend=None) in this manager
+    process, which would otherwise disable tracing for every rollout.
     """
-    if RolloutTraceConfig.get_backend() is None:
+    backend = trace_cfg.get("backend", None) if trace_cfg is not None else None
+    if backend is None:
         return set()
 
     n_rows = len(prompts)
-    max_samples = RolloutTraceConfig.get_instance().max_samples_per_step_per_worker
+    max_samples = trace_cfg.get("max_samples_per_step_per_worker", None) if trace_cfg is not None else None
     if max_samples is None:
         return set(range(n_rows))
 
@@ -436,7 +441,7 @@ class RolloutAgentLoopManagerTQ(AgentLoopManager):
         # Pick which prompts to trace this step. All `n` GRPO sessions of a chosen prompt are
         # traced together (so their rollouts can be compared in the trace UI). See
         # `_select_traced_rows`; `max_samples_per_step_per_worker=None` traces everything.
-        traced_rows = _select_traced_rows(prompts)
+        traced_rows = _select_traced_rows(prompts, config.get("trace", None))
 
         num_workers = len(self.agent_loop_workers)
         futures = []
