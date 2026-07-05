@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import os
+
 import torch
 from tensordict import TensorDict
 
@@ -92,7 +94,15 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         fields.append("rollout_is_weights")
     if "ref_log_prob" in data:
         fields.append("ref_log_prob")
+    # Carry response token ids alongside (padded, aligned with response_mask) so the LOGPROB_GAP
+    # diagnostic can name the worst-divergence token. Only when the debug knob is on and the field
+    # exists, to avoid any overhead / coupling in the normal path.
+    _lp_debug = os.getenv("VERL_LOGPROB_DEBUG", "1") not in ("0", "false", "False", "") and "responses" in data
+    if _lp_debug:
+        fields.append("responses")
     data = data.select(*fields).to_padded_tensor()
+    if _lp_debug:
+        config.global_batch_info["_lp_debug_responses"] = data["responses"]
 
     response_mask = data["response_mask"].to(bool)
     # compute policy loss

@@ -2399,7 +2399,9 @@ def _lin_slope(x: torch.Tensor, y: torch.Tensor) -> float:
     return ((xc * (y - y.mean())).sum() / denom).item()
 
 
-def _maybe_debug_logprob_gap(rollout_log_prob: torch.Tensor, log_prob: torch.Tensor, response_mask: torch.Tensor):
+def _maybe_debug_logprob_gap(
+    rollout_log_prob: torch.Tensor, log_prob: torch.Tensor, response_mask: torch.Tensor, config=None
+):
     """Print rollout(vLLM)-vs-training(FSDP) per-token logprob diagnostics for one micro-batch."""
     if os.getenv("VERL_LOGPROB_DEBUG", "1") in ("0", "false", "False", ""):
         return
@@ -2472,6 +2474,25 @@ def _maybe_debug_logprob_gap(rollout_log_prob: torch.Tensor, log_prob: torch.Ten
             fp = log_prob[si, c].item()
             toks.append(f"{c}:v{v:+.3f}/f{fp:+.3f}/d{fp - v:+.3f}")
         print(f"[LOGPROB_GAP] seq{si} pos:vLLM/FSDP/diff -> " + " ".join(toks), flush=True)
+
+        # Name the single worst-divergence token in this micro-batch (the token that dominates the
+        # k3 that drives masking). Logs its response-token id + neighbors so it can be decoded on the
+        # box (tokenizer isn't available here). responses[r] aligns with response_mask[r].
+        responses = None
+        if config is not None:
+            gbi = getattr(config, "global_batch_info", None)
+            responses = gbi.get("_lp_debug_responses") if isinstance(gbi, dict) else None
+        flat_idx = int(token_k3_full.argmax().item())
+        r, p = divmod(flat_idx, token_k3_full.shape[1])
+        worst = (
+            f"[LOGPROB_GAP] WORST_TOKEN row={r} pos={p} k3={token_k3_full[r, p].item():.4f} "
+            f"vLLM={rollout_log_prob[r, p].item():+.4f} FSDP={log_prob[r, p].item():+.4f}"
+        )
+        if responses is not None and r < responses.shape[0] and p < responses.shape[1]:
+            lo, hi = max(0, p - 3), min(responses.shape[1], p + 4)
+            window = responses[r, lo:hi].tolist()
+            worst += f" token_id={int(responses[r, p].item())} window_ids[{lo}:{hi}]={window}"
+        print(worst, flush=True)
 
 
 @register_policy_loss("bypass_mode")
@@ -2556,7 +2577,7 @@ def compute_policy_loss_bypass_mode(
     rollout_log_prob = old_log_prob
 
     # Diagnostic: compare per-token rollout(vLLM) vs training(FSDP) logprobs (VERL_LOGPROB_DEBUG=1).
-    _maybe_debug_logprob_gap(rollout_log_prob, log_prob, response_mask)
+    _maybe_debug_logprob_gap(rollout_log_prob, log_prob, response_mask, config)
 
     # Compute IS weights and rejection mask
     # Note: For PPO-clip, we still compute IS weights for metrics, but don't apply them

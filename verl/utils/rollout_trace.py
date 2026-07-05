@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
 import contextlib
 import functools
 import inspect
+import io
 import json
 import os
 from contextvars import ContextVar
@@ -315,6 +317,98 @@ def _current_trace_attributes():
     return {**(_trace_attributes.get() or {})}
 
 
+# --- MLflow multimodal trace rendering (ported from verl-async fully_async_policy) -------------
+# MLflow's trace UI renders images inline ONLY when inputs/outputs follow the OpenAI chat-messages
+# schema with {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}} content parts
+# (https://mlflow.org/docs/latest/genai/tracing/observe-with-traces/multimodal/). Raw PIL objects
+# get stored as repr strings. We walk the payload, emit one image_url per PIL image, and dump the
+# rest as a JSON text part. Pydantic models / __dict__ objects are expanded so images nested inside
+# them (e.g. AgentLoopOutput.multi_modal_data, incl. a *list* of outputs from the GUI loop) are found.
+
+
+def _is_pil_image(obj) -> bool:
+    try:
+        from PIL import Image as _PILImage
+
+        return isinstance(obj, _PILImage.Image)
+    except ImportError:
+        return False
+
+
+def _pil_to_data_uri(img) -> str:
+    # Downscale + JPEG-compress so a full-trace run (every screenshot base64'd) doesn't bloat the
+    # MLflow trace store. 1280 long-side JPEG q60 is ~100-150KB vs a 1080p PNG's several MB. Tunable.
+    max_side = int(os.getenv("VERL_TRACE_IMG_MAX_SIDE", "1280"))
+    quality = int(os.getenv("VERL_TRACE_IMG_QUALITY", "60"))
+    buf = io.BytesIO()
+    try:
+        im = img if img.mode in ("RGB", "L") else img.convert("RGB")
+        longest = max(im.size)
+        if longest > max_side:
+            scale = max_side / longest
+            im = im.resize((max(1, int(im.size[0] * scale)), max(1, int(im.size[1] * scale))))
+        im.save(buf, format="JPEG", quality=quality)
+        return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception:
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _as_walkable(obj):
+    """Expand pydantic models / plain objects to dicts so nested images are reachable."""
+    if isinstance(obj, BaseModel):
+        return obj.model_dump()
+    if hasattr(obj, "__dict__") and not isinstance(obj, type):
+        return dict(vars(obj))
+    return obj
+
+
+def _collect_images_as_content_parts(obj, _depth=0, _parts=None):
+    """Collect every PIL image in ``obj`` (any depth) as an OpenAI ``image_url`` content part."""
+    if _parts is None:
+        _parts = []
+    if _depth > 12:
+        return _parts
+    if _is_pil_image(obj):
+        _parts.append({"type": "image_url", "image_url": {"url": _pil_to_data_uri(obj)}})
+        return _parts
+    obj = _as_walkable(obj)
+    if isinstance(obj, dict):
+        for v in obj.values():
+            _collect_images_as_content_parts(v, _depth + 1, _parts)
+    elif isinstance(obj, list | tuple):
+        for v in obj:
+            _collect_images_as_content_parts(v, _depth + 1, _parts)
+    return _parts
+
+
+def _strip_images(obj, _depth=0):
+    """Return ``obj`` with PIL images removed (rendered separately as image_url parts)."""
+    if _depth > 12:
+        return repr(obj)
+    if _is_pil_image(obj):
+        return None
+    walk = _as_walkable(obj)
+    if isinstance(walk, dict):
+        return {k: _strip_images(v, _depth + 1) for k, v in walk.items()}
+    if isinstance(walk, list | tuple):
+        return [_strip_images(v, _depth + 1) for v in walk]
+    return walk
+
+
+def _to_mlflow_chat_messages(payload, *, role: str) -> dict:
+    """Wrap a payload into MLflow's OpenAI chat schema: JSON text part + one image_url per image."""
+    image_parts = _collect_images_as_content_parts(payload)
+    try:
+        text = json.dumps(_strip_images(payload), default=repr, ensure_ascii=False, indent=2)
+    except Exception:
+        text = repr(payload)
+    content_parts: list = [{"type": "text", "text": text}]
+    content_parts.extend(image_parts)
+    return {"messages": [{"role": role, "content": content_parts}]}
+
+
 def rollout_trace_op(func):
     @functools.wraps(func)
     async def async_wrapper(self, *args, **kwargs):
@@ -333,24 +427,41 @@ def rollout_trace_op(func):
         del inputs["self"]
 
         async def add_token2text(self, result):
-            if hasattr(result, "prompt_ids") and hasattr(self, "tokenizer") and hasattr(self.tokenizer, "decode"):
-                # Use model_dump() for Pydantic models to get a proper copy,
-                # otherwise vars() returns a reference to internal __dict__ which
-                # can cause serialization issues with MLflow
-                if isinstance(result, BaseModel):
-                    _result = result.model_dump()
-                else:
-                    _result = dict(vars(result))
-                loop = get_event_loop()
-                if hasattr(result, "prompt_ids"):
-                    prompt_text = await loop.run_in_executor(None, self.tokenizer.decode, result.prompt_ids)
-                    _result["prompt_text"] = prompt_text
+            """Decode prompt_ids/response_ids/token_ids to text. Handles a single AgentLoopOutput /
+            TokenOutput, and a *list* of them (the GUI multi-trajectory loop returns a list)."""
+            tokenizer = getattr(self, "tokenizer", None)
+            if tokenizer is None or not hasattr(tokenizer, "decode"):
+                return result
+            if isinstance(result, list | tuple):
+                decoded = [await add_token2text(self, r) for r in result]
+                return list(decoded)
+            if isinstance(result, BaseModel):
+                _result = result.model_dump()
+            elif hasattr(result, "__dict__"):
+                _result = dict(vars(result))
+            else:
+                return result
+            loop = get_event_loop()
+            if hasattr(result, "prompt_ids"):
+                _result["prompt_text"] = await loop.run_in_executor(None, tokenizer.decode, result.prompt_ids)
+            if hasattr(result, "response_ids"):
+                _result["response_text"] = await loop.run_in_executor(None, tokenizer.decode, result.response_ids)
+            # TokenOutput (generate): token_ids holds the response tokens.
+            if hasattr(result, "token_ids") and not hasattr(result, "prompt_ids"):
+                _result["response_text"] = await loop.run_in_executor(None, tokenizer.decode, result.token_ids)
+            return _result
 
-                if hasattr(result, "response_ids"):
-                    response_text = await loop.run_in_executor(None, self.tokenizer.decode, result.response_ids)
-                    _result["response_text"] = response_text
-                return _result
-            return result
+        async def add_token2text_to_inputs(self, inputs_dict):
+            """Decode a prompt_ids field in the inputs dict so the trace shows readable text."""
+            tokenizer = getattr(self, "tokenizer", None)
+            if tokenizer is None or not hasattr(tokenizer, "decode"):
+                return inputs_dict
+            prompt_ids = inputs_dict.get("prompt_ids")
+            if isinstance(prompt_ids, list | tuple) and len(prompt_ids) > 0:
+                loop = get_event_loop()
+                prompt_text = await loop.run_in_executor(None, tokenizer.decode, prompt_ids)
+                inputs_dict = {**inputs_dict, "prompt_text": prompt_text}
+            return inputs_dict
 
         if backend == "weave":
             tracer = RolloutTraceConfig.get_client()
@@ -375,13 +486,14 @@ def rollout_trace_op(func):
             import mlflow
 
             with mlflow.start_span(name=func.__qualname__) as span:
-                span.set_inputs(inputs)
-                result = await func(self, *args, **kwargs)
+                # Wrap into the OpenAI chat schema so MLflow renders screenshots inline (image_url
+                # parts) and the decoded prompt/response as the text part.
                 if enable_token2text:
-                    _result = await add_token2text(self, result)
-                    span.set_outputs(_result)
-                else:
-                    span.set_outputs(result)
+                    inputs = await add_token2text_to_inputs(self, inputs)
+                span.set_inputs(_to_mlflow_chat_messages(inputs, role="user"))
+                result = await func(self, *args, **kwargs)
+                _out = await add_token2text(self, result) if enable_token2text else result
+                span.set_outputs(_to_mlflow_chat_messages(_out, role="assistant"))
 
             return result
         elif backend == "trackio":

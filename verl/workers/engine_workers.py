@@ -325,6 +325,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
     def train_batch(self, data: TensorDict) -> TensorDict:
         assert self.loss_fn is not None, "loss function can't be None when calling train_batch"
         assert not self.engine_config.forward_only, "Can't run `train_batch` when forward_only is in the engine config."
+        # Reset the peak tracker so `perf/max_memory_allocated_gb` (read in _postprocess_output)
+        # reflects THIS step's peak, not the monotonic running max since process start (which grows
+        # with steps-elapsed and made cross-run/bs comparisons meaningless).
+        get_torch_device().reset_peak_memory_stats()
         # global_token_num should be a list of number of tokens of each seq in this batch
         global_token_num = tu.get(data, key="global_token_num")
         disable_auto_offload = tu.get(data, key="disable_auto_offload", default=False)

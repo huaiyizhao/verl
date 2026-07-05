@@ -147,39 +147,30 @@ def _mm_rowcheck(data, module, where: str) -> None:
         for i, _, _, _, fp in rows:
             if fp is not None:
                 fp_to_rows.setdefault(fp, []).append(i)
+        # print(flush=True) rather than logger.* so it reaches the Ray job-driver log (worker
+        # logger records go to per-worker files and are easy to miss during a live bug hunt).
         if bad:
             for i, n_tok, n_feat, n_img, fp in bad:
                 dup = [j for j in fp_to_rows.get(fp, []) if j != i]
-                logger.error(
-                    "[MM_ROWCHECK] where=%s row=%d/%d image_tokens=%d features=%d n_images=%d dup_of_rows=%s fp=%s",
-                    where,
-                    i,
-                    n,
-                    n_tok,
-                    n_feat,
-                    n_img,
-                    dup if dup else "UNIQUE",
-                    fp,
+                print(
+                    f"[MM_ROWCHECK] where={where} row={i}/{n} image_tokens={n_tok} features={n_feat} "
+                    f"n_images={n_img} dup_of_rows={dup if dup else 'UNIQUE'} fp={fp}",
+                    flush=True,
                 )
-            logger.error(
-                "[MM_ROWCHECK] where=%s %d/%d image-rows INCONSISTENT pre-pack -> bug is in "
-                "materialize/resolve (NOT packing); n_unique_fingerprints=%d/%d",
-                where,
-                len(bad),
-                img_rows,
-                len(fp_to_rows),
-                img_rows,
+            print(
+                f"[MM_ROWCHECK] where={where} {len(bad)}/{img_rows} image-rows INCONSISTENT pre-pack -> "
+                f"bug is in materialize/resolve (NOT packing); n_unique_fingerprints={len(fp_to_rows)}/{img_rows}",
+                flush=True,
             )
         elif img_rows and _MM_ROWCHECK_OK_LOGGED[0] < 5:
             _MM_ROWCHECK_OK_LOGGED[0] += 1
-            logger.warning(
-                "[MM_ROWCHECK] where=%s all %d image-rows consistent pre-pack -> if forward still "
-                "crashes, bug is in packing",
-                where,
-                img_rows,
+            print(
+                f"[MM_ROWCHECK] where={where} all {img_rows} image-rows consistent pre-pack -> "
+                f"if forward still crashes, bug is in packing",
+                flush=True,
             )
     except Exception as e:  # noqa: BLE001 - diagnostic must never break training
-        logger.error("[MM_ROWCHECK] check failed: %r", e)
+        print(f"[MM_ROWCHECK] check failed: {e!r}", flush=True)
 
 
 device_name = get_device_name()
