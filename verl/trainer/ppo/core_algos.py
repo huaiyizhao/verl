@@ -20,6 +20,7 @@ implement PPO-like algorithms.
 
 __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 
+import os
 from collections import defaultdict
 from enum import Enum
 from typing import Any, Callable, Optional
@@ -2529,6 +2530,80 @@ def _empty_bypass_rollout_correction_metrics(
     return metrics
 
 
+# --- rollout(vLLM) vs training(FSDP) per-token logprob gap diagnostic (ported from verl-v1) ---------
+# The async path uses the SAME bypass_mode (old_log_prob = vLLM rollout logprob; RS mask on the k3 gap),
+# so it can have the same train<->infer gap as v1. This prints the SAME [LOGPROB_GAP] line format as
+# verl-v1 so the two paths compare line-for-line. ON by default (VERL_LOGPROB_DEBUG=0 to silence),
+# rank-0 only, capped at VERL_LOGPROB_DEBUG_MAX prints. Metrics: mean_abs_d = |FSDP-vLLM| over response
+# tokens; seq_masked@0.005 = fraction of sequences the RS mask would drop; temp_slope != 0 => temperature
+# mismatch; pos0_d >> rest_d => first-token/prefill mismatch.
+_LOGPROB_DEBUG_COUNT = 0
+_LOGPROB_DEBUG_MAX = int(os.getenv("VERL_LOGPROB_DEBUG_MAX", "40"))
+
+
+def _lp_lin_slope(x: torch.Tensor, y: torch.Tensor) -> float:
+    """OLS slope of y on x (0.0 if x is constant)."""
+    xc = x - x.mean()
+    denom = (xc * xc).sum()
+    if denom <= 0:
+        return 0.0
+    return ((xc * (y - y.mean())).sum() / denom).item()
+
+
+def _maybe_debug_logprob_gap(rollout_log_prob, log_prob, response_mask):
+    """Print rollout(vLLM)-vs-training(FSDP) per-token logprob gap for one micro-batch (same format as
+    verl-v1's [LOGPROB_GAP], so the async and v1 paths are directly comparable)."""
+    if os.getenv("VERL_LOGPROB_DEBUG", "1") in ("0", "false", "False", ""):
+        return
+    global _LOGPROB_DEBUG_COUNT
+    if _LOGPROB_DEBUG_COUNT >= _LOGPROB_DEBUG_MAX:
+        return
+    try:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    except Exception:  # noqa: BLE001
+        rank = 0
+    if rank != 0:
+        return
+    with torch.no_grad():
+        mask = response_mask.bool()
+        if int(mask.sum()) == 0:
+            return
+        _LOGPROB_DEBUG_COUNT += 1
+        roll = rollout_log_prob.float()
+        tr = log_prob.float()
+        diff = tr - roll  # >0: FSDP assigns higher prob than vLLM; <0: lower
+        vd = diff[mask]
+        vroll = roll[mask]
+        abs_d = vd.abs()
+        temp_slope = _lp_lin_slope(vroll, vd)  # diff ~ slope*logp => temperature/logit-scale mismatch
+        pos = torch.cumsum(mask.long(), dim=1) - 1
+        pos_v = pos[mask].float()
+        first = pos_v == 0
+        pos0_d = vd[first].mean().item() if bool(first.any()) else float("nan")
+        rest_d = vd[~first].mean().item() if bool((~first).any()) else float("nan")
+        pos_slope = _lp_lin_slope(pos_v, vd)
+        # k3 = exp(d)-1-d, what the RS mask thresholds on (0.005 in the run config).
+        token_k3_full = (torch.exp(diff.clamp(-20, 20)) - 1.0 - diff) * mask
+        seq_len = mask.sum(dim=1).clamp(min=1)
+        seq_valid = mask.sum(dim=1) > 0
+        seq_mean_k3 = (token_k3_full.sum(dim=1) / seq_len)[seq_valid]
+        frac_seq_over_thr = (seq_mean_k3 > 0.005).float().mean().item() if seq_mean_k3.numel() else 0.0
+        conf = vroll.abs() < 0.1  # near-deterministic tokens
+        unc = vroll.abs() > 1.0  # high-entropy tokens (where the learning signal is)
+        conf_abs_d = abs_d[conf].mean().item() if bool(conf.any()) else 0.0
+        unc_abs_d = abs_d[unc].mean().item() if bool(unc.any()) else 0.0
+        print(
+            f"[LOGPROB_GAP] call#{_LOGPROB_DEBUG_COUNT} valid_tok={vd.numel()} "
+            f"mean_signed_d={vd.mean().item():+.5f} mean_abs_d={abs_d.mean().item():.5f} "
+            f"max_abs_d={abs_d.max().item():.5f} std_d={vd.std().item():.5f} "
+            f"frac>0.05={(abs_d > 0.05).float().mean().item():.3f} frac>0.1={(abs_d > 0.1).float().mean().item():.3f} "
+            f"| seq_mean_k3={seq_mean_k3.mean().item():.5f} seq_masked@0.005={frac_seq_over_thr:.3f} "
+            f"| abs_d[confident]={conf_abs_d:.5f} abs_d[uncertain]={unc_abs_d:.5f} "
+            f"| temp_slope={temp_slope:+.4f} pos_slope={pos_slope:+.6f} pos0_d={pos0_d:+.5f} rest_d={rest_d:+.5f}",
+            flush=True,
+        )
+
+
 @register_policy_loss("bypass_mode")
 def compute_policy_loss_bypass_mode(
     old_log_prob: torch.Tensor,
@@ -2609,6 +2684,10 @@ def compute_policy_loss_bypass_mode(
 
     # In bypass mode: old_log_prob IS rollout_log_prob
     rollout_log_prob = old_log_prob
+
+    # Diagnostic: record the rollout(vLLM) vs training(FSDP) per-token logprob gap on THIS async path,
+    # in the same [LOGPROB_GAP] format as verl-v1, so we can confirm whether it has the gap too.
+    _maybe_debug_logprob_gap(rollout_log_prob, log_prob, response_mask)
 
     if not response_mask.any():
         # Padding-only micro-batches can appear after fully-async padding and
