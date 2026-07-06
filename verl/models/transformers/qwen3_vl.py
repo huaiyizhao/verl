@@ -320,6 +320,42 @@ class Qwen3VLCausalLMOutputForPPO(Qwen3VLCausalLMOutputWithPast):
     entropy: Optional[torch.FloatTensor] = None
 
 
+def _inject_varlen_cu_seqlens(kwargs: dict) -> None:
+    """Build per-sequence flash-attn ``cu_seqlens`` for verl's remove_padding packed forward.
+
+    verl's ``remove_padding`` packs a whole micro-batch into ONE flat sequence
+    (batch=1, total_nnz) with ``attention_mask=None`` and ``position_ids`` that reset to 0 at each
+    sequence start. Unlike Qwen2-VL, Qwen3-VL's stock text attention does NOT derive ``cu_seqlens``
+    from ``position_ids`` — it just forwards ``**kwargs`` (``FlashAttentionKwargs``) to the attention
+    interface. With no boundaries, flash-attn treats the whole pack as ONE causal sequence, so later
+    sequences attend into earlier ones (cross-sequence leak -> wrong logp on long multi-image packs,
+    which is what trips the rollout-correction mask). Fix: derive the boundaries from
+    ``position_ids[0]`` (the absolute channel, == 0 at each sequence start) and thread them down as
+    ``FlashAttentionKwargs`` so each packed sequence attends only to itself (mirrors what Qwen3-VL's
+    Vision attention already does with ``cu_seq_lens_q/k``). No-op for the padded path (attention_mask
+    present) or a single sequence.
+    """
+    if kwargs.get("attention_mask", None) is not None:
+        return  # padded path uses attention_mask; not the packed case
+    position_ids = kwargs.get("position_ids", None)
+    if position_ids is None:
+        return
+    # mrope position_ids: (channels, batch, seq); channel 0 = absolute position (0 at each seq start).
+    pos0 = position_ids[0] if position_ids.dim() == 3 else position_ids
+    if pos0.dim() != 2 or pos0.shape[0] != 1:
+        return  # only the packed (batch==1 flat) case; skip normal padded/batched inputs
+    pos0 = pos0.reshape(-1)
+    starts = (pos0 == 0).nonzero(as_tuple=False).view(-1).to(torch.int32)
+    if starts.numel() <= 1:
+        return  # single sequence -> nothing to split
+    cu = torch.cat([starts, torch.tensor([pos0.numel()], device=pos0.device, dtype=torch.int32)])
+    max_len = int((cu[1:] - cu[:-1]).max())
+    kwargs["cu_seq_lens_q"] = cu
+    kwargs["cu_seq_lens_k"] = cu
+    kwargs["max_length_q"] = max_len
+    kwargs["max_length_k"] = max_len
+
+
 def qwen3_vl_base_forward(
     self: "Qwen3VLForConditionalGeneration",
     input_ids: torch.LongTensor,
@@ -334,6 +370,7 @@ def qwen3_vl_base_forward(
         self, input_ids, attention_mask, pixel_values, pixel_values_videos, image_grid_thw, video_grid_thw
     )  # avoid lora module having multiple keyword arguments
     kwargs.update(input_kwargs)
+    _inject_varlen_cu_seqlens(kwargs)  # remove_padding: give flash-attn per-sequence boundaries
     return self.language_model(
         input_ids=None,
         **kwargs,
