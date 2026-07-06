@@ -193,6 +193,60 @@ class ToolListWrap:
         self.tools = tools
 
 
+_OVERLONG_LOG_COUNT = [0]
+
+
+def _maybe_log_overlong_prompt(tokenizer, prompt_ids, n_img, total, prompt_length, cap=3, part_cap=1500):
+    """Decode an over-length multimodal prompt with image-token runs collapsed, to locate the bloat.
+
+    Prints the REAL per-image token counts (fixed ~2040 or oversized?) and the text between images
+    (huge tool outputs? repeated system prompt?). Gated by VERL_LOG_OVERLONG_PROMPT (default on),
+    capped at ``cap`` prints, each text chunk truncated to ``part_cap`` chars so it can't flood.
+    """
+    if os.getenv("VERL_LOG_OVERLONG_PROMPT", "1") in ("0", "false", "False", ""):
+        return
+    if _OVERLONG_LOG_COUNT[0] >= cap:
+        return
+    _OVERLONG_LOG_COUNT[0] += 1
+    try:
+        ids = prompt_ids.tolist() if hasattr(prompt_ids, "tolist") else list(prompt_ids)
+        try:
+            img_id = tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        except Exception:  # noqa: BLE001
+            img_id = None
+        img_sizes, parts, i, n = [], [], 0, len(ids)
+        while i < n:
+            if img_id is not None and ids[i] == img_id:
+                j = i
+                while j < n and ids[j] == img_id:
+                    j += 1
+                img_sizes.append(j - i)
+                parts.append(f"<|IMG×{j - i}|>")
+                i = j
+            else:
+                j = i
+                while j < n and (img_id is None or ids[j] != img_id):
+                    j += 1
+                txt = tokenizer.decode(ids[i:j])
+                if len(txt) > part_cap:
+                    txt = (
+                        txt[: part_cap // 2]
+                        + f"\n...[{len(txt) - part_cap} chars omitted]...\n"
+                        + txt[-part_cap // 2 :]
+                    )
+                parts.append(txt)
+                i = j
+        text_tok = total - sum(img_sizes)
+        print(
+            f"[OVERLONG_PROMPT #{_OVERLONG_LOG_COUNT[0]}] total={total} > {prompt_length} | n_img={n_img} "
+            f"img_tok_each={img_sizes} text_tok={text_tok}\n"
+            f"----- decoded (images collapsed) -----\n{''.join(parts)}\n----- end -----",
+            flush=True,
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[OVERLONG_PROMPT] decode failed: {e!r}", flush=True)
+
+
 class AgentLoopBase(ABC):
     """An agent loop takes an input message, chat with OpenAI compatible LLM server and interact with various
     environments.
@@ -438,6 +492,9 @@ class AgentLoopBase(ABC):
                 # => the sliding window is not being applied to the rollout prompt.
                 n_img = len(images) if images else 0
                 per_img = f", ~{len(prompt_ids) // n_img} tok/image" if n_img else ""
+                # Print the real prompt (images collapsed to <|IMG×N|>) so we can SEE what overflowed:
+                # real per-image token counts + the text (giant tool outputs? repeated system prompt?).
+                _maybe_log_overlong_prompt(self.tokenizer, prompt_ids, n_img, len(prompt_ids), prompt_length)
                 raise ValueError(
                     f"Multimodal prompt produced {len(prompt_ids)} tokens "
                     f"({n_img} images, {len(videos) if videos else 0} videos{per_img}), exceeding "
