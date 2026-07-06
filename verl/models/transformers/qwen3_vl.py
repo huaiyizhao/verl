@@ -320,6 +320,10 @@ class Qwen3VLCausalLMOutputForPPO(Qwen3VLCausalLMOutputWithPast):
     entropy: Optional[torch.FloatTensor] = None
 
 
+# Mutable counter so the one-shot [VARLEN_PATCH] diagnostic prints only the first few forwards.
+_VARLEN_DBG = [0]
+
+
 def _inject_varlen_cu_seqlens(kwargs: dict) -> None:
     """Build per-sequence flash-attn ``cu_seqlens`` for verl's remove_padding packed forward.
 
@@ -335,18 +339,35 @@ def _inject_varlen_cu_seqlens(kwargs: dict) -> None:
     Vision attention already does with ``cu_seq_lens_q/k``). No-op for the padded path (attention_mask
     present) or a single sequence.
     """
-    if kwargs.get("attention_mask", None) is not None:
+    # One-shot diagnostic: print the first few times so we can confirm on the box whether the patch
+    # actually fires (and which early-return, if any, it hits). Gated by VERL_VARLEN_PATCH_DEBUG.
+    _dbg = os.environ.get("VERL_VARLEN_PATCH_DEBUG", "1") == "1" and _VARLEN_DBG[0] < 6
+
+    def _emit(msg):
+        if _dbg:
+            _VARLEN_DBG[0] += 1
+            print(f"[VARLEN_PATCH] {msg}", flush=True)
+
+    am = kwargs.get("attention_mask", None)
+    if am is not None:
+        _emit(f"EARLY-RETURN: attention_mask is not None (shape={tuple(am.shape)}) -> padded path, no inject")
         return  # padded path uses attention_mask; not the packed case
     position_ids = kwargs.get("position_ids", None)
     if position_ids is None:
+        _emit("EARLY-RETURN: position_ids is None")
         return
     # mrope position_ids: (channels, batch, seq); channel 0 = absolute position (0 at each seq start).
     pos0 = position_ids[0] if position_ids.dim() == 3 else position_ids
     if pos0.dim() != 2 or pos0.shape[0] != 1:
+        _emit(
+            f"EARLY-RETURN: unexpected shape position_ids={tuple(position_ids.shape)} "
+            f"pos0={tuple(pos0.shape)} (want pos0 dim==2, shape[0]==1)"
+        )
         return  # only the packed (batch==1 flat) case; skip normal padded/batched inputs
     pos0 = pos0.reshape(-1)
     starts = (pos0 == 0).nonzero(as_tuple=False).view(-1).to(torch.int32)
     if starts.numel() <= 1:
+        _emit(f"EARLY-RETURN: only {starts.numel()} sequence in pack (nothing to split); total_len={pos0.numel()}")
         return  # single sequence -> nothing to split
     cu = torch.cat([starts, torch.tensor([pos0.numel()], device=pos0.device, dtype=torch.int32)])
     max_len = int((cu[1:] - cu[:-1]).max())
@@ -354,6 +375,10 @@ def _inject_varlen_cu_seqlens(kwargs: dict) -> None:
     kwargs["cu_seq_lens_k"] = cu
     kwargs["max_length_q"] = max_len
     kwargs["max_length_k"] = max_len
+    _emit(
+        f"INJECTED: n_seqs={starts.numel()} total_len={pos0.numel()} max_len={max_len} "
+        f"seq_lens={(cu[1:] - cu[:-1]).tolist()} | kwargs_keys_now={sorted(kwargs.keys())}"
+    )
 
 
 def qwen3_vl_base_forward(
