@@ -2458,6 +2458,21 @@ _ENTROPY_ASYM_ACC = {
 # unknown kwargs. Per-process sequential forward, so a plain global is safe.
 _LP_DEBUG_RESPONSES = None
 
+# Max per-sequence mean-k3 of the current micro-batch, stashed by the bypass-mode loss so the offline
+# probe (transformer_impl._maybe_dump_logprob_probe) can dump ONLY a batch that actually trips the RS
+# mask (seq-mean-k3 > threshold), instead of the first (often unmasked) batch.
+_PROBE_MAXK3 = [0.0]
+
+
+def set_probe_maxk3(v):
+    """Stash the current micro-batch's max per-sequence mean-k3 for the offline probe's mask gate."""
+    _PROBE_MAXK3[0] = v
+
+
+def get_probe_maxk3():
+    """Return the last micro-batch's max per-sequence mean-k3 (see set_probe_maxk3)."""
+    return _PROBE_MAXK3[0]
+
 
 def set_lp_debug_responses(responses):
     """Stash padded response ids for the LOGPROB_GAP WORST_TOKEN diagnostic (see above)."""
@@ -2702,6 +2717,15 @@ def compute_policy_loss_bypass_mode(
 
     # Diagnostic: compare per-token rollout(vLLM) vs training(FSDP) logprobs (VERL_LOGPROB_DEBUG=1).
     _maybe_debug_logprob_gap(rollout_log_prob, log_prob, response_mask, config)
+
+    # Stash max per-seq mean-k3 (aligned tensors here) so the offline probe can target a MASKED batch.
+    if os.getenv("VERL_LOGPROB_PROBE_DUMP", "0") not in ("0", "false", "False", ""):
+        with torch.no_grad():
+            _d = (log_prob - rollout_log_prob).clamp(-20, 20)
+            _tk3 = (torch.exp(_d) - 1.0 - _d) * response_mask
+            _seqk3 = _tk3.sum(dim=-1) / response_mask.sum(dim=-1).clamp(min=1)
+            _valid = response_mask.sum(dim=-1) > 0
+            set_probe_maxk3(float(_seqk3[_valid].max().item()) if bool(_valid.any()) else 0.0)
 
     # Compute IS weights and rejection mask
     # Note: For PPO-clip, we still compute IS weights for metrics, but don't apply them

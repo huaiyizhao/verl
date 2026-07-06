@@ -192,6 +192,20 @@ def _maybe_dump_logprob_probe(micro_batch, model_output) -> None:
         rank = 0
     if rank != 0:
         return
+    # k3 gate: only dump a micro-batch that actually trips the RS mask (max per-seq mean-k3 > thr),
+    # so we capture a MASKED batch, not the first (often unmasked) one. thr default 0.006 (just above
+    # the 0.005 mask threshold); set VERL_LOGPROB_PROBE_MIN_K3=0 to dump the first batch unconditionally.
+    min_k3 = float(os.getenv("VERL_LOGPROB_PROBE_MIN_K3", "0.006"))
+    if min_k3 > 0:
+        try:
+            from verl.trainer.ppo.core_algos import get_probe_maxk3
+
+            cur_k3 = get_probe_maxk3()
+        except Exception:  # noqa: BLE001
+            cur_k3 = 0.0
+        if cur_k3 < min_k3:
+            return
+        print(f"[LOGPROB_PROBE] masked batch found (max seq_mean_k3={cur_k3:.5f} >= {min_k3}) -> dumping", flush=True)
     try:
 
         def _unnest(x):
@@ -1543,12 +1557,13 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 output=raw_output, output_args=output_args, micro_batch=micro_batch, logits_processor_func=loss_function
             )
 
-            _maybe_dump_logprob_probe(micro_batch, model_output)
-
             if loss_function is not None:
                 loss, metrics = loss_function(
                     model_output=model_output, data=micro_batch, dp_group=self.get_data_parallel_group()
                 )
+                # AFTER the loss: the loss has stashed this batch's max seq-mean-k3, so the probe can
+                # gate on it and dump only a MASKED batch (see _maybe_dump_logprob_probe).
+                _maybe_dump_logprob_probe(micro_batch, model_output)
             else:
                 assert forward_only, "forward_only must be True when loss_function is None"
                 loss = torch.tensor(1.0, device=device_name)
