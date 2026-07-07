@@ -83,6 +83,68 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+# One-shot dump of a real async training micro-batch (raw tokens + pixels + BOTH logprobs) so the
+# vLLM<->FSDP logprob gap on this path can be compared OFFLINE with the microbench in a single pass:
+#   old_log_probs  = async's rollout(vLLM) logprob (bypass_mode sets old = rollout_log_probs)
+#   fsdp_log_probs = async's FSDP forward logprob (this engine, current weights)
+# Gate: VERL_LOGPROB_PROBE_DUMP=1. Writes probe_rank0_0.pt to VERL_LOGPROB_PROBE_DIR (default /tmp).
+_LOGPROB_PROBE_DONE = [0]
+
+
+def _maybe_dump_logprob_probe(micro_batch, model_inputs, model_output) -> None:
+    if os.getenv("VERL_LOGPROB_PROBE_DUMP", "0") in ("0", "false", "False", ""):
+        return
+    cap = int(os.getenv("VERL_LOGPROB_PROBE_MAX", "1"))
+    if _LOGPROB_PROBE_DONE[0] >= cap:
+        return
+    try:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    except Exception:  # noqa: BLE001
+        rank = 0
+    if rank != 0:
+        return
+    # only the actor-update forward carries old_log_probs (bypass: old = rollout vLLM logp); skip the
+    # ref / rollout-logprob passes so the bundle always has BOTH A(vLLM) and B(FSDP).
+    if micro_batch.get("old_log_probs") is None:
+        return
+    try:
+
+        def _unnest(x):
+            if x is None:
+                return None
+            if hasattr(x, "offsets") and callable(getattr(x, "offsets", None)):
+                try:
+                    return {"values": x.values().detach().cpu(), "offsets": x.offsets().detach().cpu()}
+                except Exception:  # noqa: BLE001
+                    pass
+            if torch.is_tensor(x):
+                return x.detach().cpu()
+            return x
+
+        mi = model_inputs if isinstance(model_inputs, dict) else {}
+        bundle = {
+            "input_ids": _unnest(micro_batch.get("input_ids")),  # raw per-seq tokens (prompt+response)
+            "position_ids": _unnest(micro_batch.get("position_ids")),
+            "responses": _unnest(micro_batch.get("responses")),
+            "response_mask": _unnest(micro_batch.get("response_mask")),
+            "old_log_probs": _unnest(micro_batch.get("old_log_probs")),  # A = async vLLM (bypass_mode)
+            "rollout_log_probs": _unnest(micro_batch.get("rollout_log_probs")),
+            "temperature": _unnest(micro_batch.get("temperature")),
+            "fsdp_log_probs": _unnest(model_output.get("log_probs")) if isinstance(model_output, dict) else None,  # B
+            "pixel_values": _unnest(mi.get("pixel_values")),  # resolved forward pixels (all images concat)
+            "image_grid_thw": _unnest(mi.get("image_grid_thw")),
+            "model_path": os.getenv("VERL_LOGPROB_DEBUG_TOKENIZER", ""),
+        }
+        out_dir = os.getenv("VERL_LOGPROB_PROBE_DIR", "/tmp/logprob_probe")
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, f"probe_rank{rank}_{_LOGPROB_PROBE_DONE[0]}.pt")
+        torch.save(bundle, path)
+        _LOGPROB_PROBE_DONE[0] += 1
+        print(f"[LOGPROB_PROBE] dumped async micro-batch (tokens+pixels+vLLM/FSDP logp) -> {path}", flush=True)
+    except Exception as e:  # noqa: BLE001 - probe must never break training
+        print(f"[LOGPROB_PROBE] dump failed: {e!r}", flush=True)
+
+
 class FSDPEngine(BaseEngine):
     """
     Concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP).
@@ -1452,6 +1514,10 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 output=raw_output, output_args=output_args, micro_batch=micro_batch, logits_processor_func=loss_function
             )
             prepare_model_outputs_s = time.perf_counter() - prepare_outputs_start if timing_enabled else 0.0
+
+            # One-shot dump: raw tokens + pixels + async's vLLM(old) & FSDP(fsdp) logprobs for offline
+            # microbench comparison (gated by VERL_LOGPROB_PROBE_DUMP=1).
+            _maybe_dump_logprob_probe(micro_batch, model_inputs, model_output)
 
             loss_start = time.perf_counter() if timing_enabled else None
             if loss_function is not None:
