@@ -72,6 +72,7 @@ logger = logging.getLogger(__name__)
 _PROFILE = os.getenv("VERL_PROFILE", "0") not in ("0", "false", "False", "")
 _STEP_PROFILE = _PROFILE or os.getenv("VERL_STEP_PROFILE", "0") not in ("0", "false", "False", "")
 _RESOLVE_DBG = [0]  # cap the per-row image_ids dump so it never floods the log
+_PIXFP_DBG = [0]  # cap the VERL_PIXEL_FINGERPRINT train-side pixel-integrity self-check
 
 # Separate TQ partitions for deduped image payloads (train / validation kept
 # apart so val GC never deletes a train image and vice-versa).
@@ -409,6 +410,34 @@ async def resolve_image_ids(
         for key in ids:
             if key not in fetched:
                 fetched[key] = cache.get(key)
+
+    # Train-side pixel integrity self-check (gated by VERL_PIXEL_FINGERPRINT=1). The store is
+    # content-addressed: each key ends with content_key(pixel_values, image_grid_thw). This is the
+    # DIRECT train-vs-infer pixel comparison for the logprob-gap hunt:
+    #   * hash_match=False  -> the fetch/dedup/unbind returned the WRONG image for this key, so the
+    #                          FSDP train forward sees a different screenshot than vLLM used at rollout.
+    #   * bf16_roundtrip=True -> the stored pixels are bf16-precision (multimodal_storage_bf16 path);
+    #                          train loses precision vs vLLM's fp32 processing.
+    if os.getenv("VERL_PIXEL_FINGERPRINT", "0") == "1" and _PIXFP_DBG[0] < 40:
+        for key, payload in fetched.items():
+            if _PIXFP_DBG[0] >= 40:
+                break
+            pv = payload.get("pixel_values")
+            grid = payload.get("image_grid_thw")
+            if pv is None or grid is None:
+                continue
+            _PIXFP_DBG[0] += 1
+            recomputed = content_key(pv, grid)
+            ok = key.endswith(recomputed)
+            pvf = pv.detach().cpu().float()
+            bf16_rt = torch.equal(pvf, pvf.to(torch.bfloat16).to(torch.float32))
+            print(
+                f"[PIXEL_FP] key=...{key[-16:]} hash_match={ok} "
+                f"{'OK' if ok else 'MISMATCH<-store returned WRONG pixels for this key!'} | "
+                f"shape={tuple(pv.shape)} dtype={pv.dtype} bf16_roundtrip={bf16_rt} "
+                f"mean={pvf.mean():.4f} std={pvf.std():.4f}",
+                flush=True,
+            )
 
     _t = time.perf_counter()
     mm_per_row = reconstruct_row_multimodal(image_ids_per_row, fetched)

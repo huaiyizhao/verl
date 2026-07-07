@@ -15,6 +15,7 @@
 Apply monkey-patch function to models
 """
 
+import os
 import sys
 from types import SimpleNamespace
 from typing import Optional
@@ -439,8 +440,17 @@ def apply_monkey_patch(
         Qwen3VLMoeModel.forward = qwen3_vl_base_forward
         Qwen3VLForConditionalGeneration.forward = forward_with_normal_backend
         Qwen3VLMoeForConditionalGeneration.forward = forward_with_normal_backend
-        Qwen3VLMoeVisionModel.fast_pos_embed_interpolate = fast_pos_embed_interpolate
-        Qwen3VLVisionModel.fast_pos_embed_interpolate = fast_pos_embed_interpolate
+        # DIAGNOSTIC A/B: verl-v1 patches the vision pos-embed interpolation onto Qwen3-VL here, but
+        # verl-async does NOT — and verl-async's train<->infer LOGPROB_GAP is ~0.01 while v1's is ~0.28.
+        # Set VERL_DISABLE_QWEN3VL_POSEMB_PATCH=1 to SKIP this patch (use stock, like async) and test
+        # whether it is what drives v1's vision gap. Safe while param_offload=False (the patch's only
+        # stated purpose was a cpu_offload device fix). If the gap collapses to ~async levels, this patch
+        # is the root cause; then compare the custom vs stock fast_pos_embed_interpolate numerics.
+        if os.environ.get("VERL_DISABLE_QWEN3VL_POSEMB_PATCH", "0") == "1":
+            print("[DIAG] SKIPPED Qwen3VL fast_pos_embed_interpolate patch (stock, like verl-async)", flush=True)
+        else:
+            Qwen3VLMoeVisionModel.fast_pos_embed_interpolate = fast_pos_embed_interpolate
+            Qwen3VLVisionModel.fast_pos_embed_interpolate = fast_pos_embed_interpolate
         print(f"Monkey patch {model.__class__.__name__} model forward")
 
         # Step 1.5: patch Qwen3VLMoeTextSparseMoeBlock to fix transformers 4.57.3 bug
