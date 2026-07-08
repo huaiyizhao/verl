@@ -1479,6 +1479,15 @@ class PPOTrainer(ABC):
             "dataloader_kwargs": {"shuffle": self.config.actor_rollout_ref.actor.shuffle},
             "temperature": self.config.actor_rollout_ref.rollout.temperature,
         }
+        if os.getenv("VERL_LOGPROB_PROBE_DUMP", "0") not in ("0", "false", "False", ""):
+            extra_info.update(
+                {
+                    "trainer_global_steps": self.global_steps,
+                    "probe_batch_keys": list(batch.keys),
+                    "probe_batch_tags": [dict(tag) for tag in batch.tags],
+                    "probe_parameter_sync_step": self.parameter_sync_step,
+                }
+            )
         batch.extra_info.update(extra_info)
 
         output: TensorDict = self.actor_rollout_wg.update_actor(batch)

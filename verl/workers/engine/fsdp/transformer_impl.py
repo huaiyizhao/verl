@@ -180,8 +180,288 @@ def _mm_rowcheck(data, module, where: str) -> None:
 _LOGPROB_PROBE_DONE = [0]
 
 
-def _maybe_dump_logprob_probe(micro_batch, model_output) -> None:
-    if os.getenv("VERL_LOGPROB_PROBE_DUMP", "0") in ("0", "false", "False", ""):
+def _logprob_probe_dump_enabled() -> bool:
+    return os.getenv("VERL_LOGPROB_PROBE_DUMP", "0") not in ("0", "false", "False", "")
+
+
+def _logprob_probe_enabled_on_rank0() -> bool:
+    if not _logprob_probe_dump_enabled():
+        return False
+    if os.getenv("VERL_LOGPROB_PROBE_REF", "1") in ("0", "false", "False", ""):
+        return False
+    try:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    except Exception:  # noqa: BLE001
+        rank = 0
+    return rank == 0
+
+
+def _response_frame_info(input_ids, responses, response_mask, device: torch.device) -> dict[str, torch.Tensor] | None:
+    """Flat logits rows whose next-token labels are response-frame tokens."""
+    try:
+        cu_seqlens = input_ids.offsets().to(device=device)
+        n_seq = int(cu_seqlens.numel() - 1)
+
+        if responses is not None and getattr(responses, "is_nested", False):
+            response_lens = responses.offsets().diff().to(device=device)
+        elif torch.is_tensor(responses) and responses.dim() >= 2 and responses.shape[0] == n_seq:
+            response_lens = torch.full((n_seq,), int(responses.shape[1]), dtype=torch.long, device=device)
+        elif response_mask is not None and getattr(response_mask, "is_nested", False):
+            response_lens = response_mask.offsets().diff().to(device=device)
+        elif torch.is_tensor(response_mask) and response_mask.dim() >= 2 and response_mask.shape[0] == n_seq:
+            response_lens = torch.full((n_seq,), int(response_mask.shape[1]), dtype=torch.long, device=device)
+        else:
+            return None
+
+        if response_mask is not None and getattr(response_mask, "is_nested", False):
+            rm_values = response_mask.values().to(device=device).bool()
+            rm_offsets = response_mask.offsets().to(device=device)
+        else:
+            rm_values, rm_offsets = None, None
+
+        rows, seq_ids, rel_pos, valid, resp_lens = [], [], [], [], []
+        for i, (resp_len, seq_offset) in enumerate(zip(response_lens.tolist(), cu_seqlens[1:].tolist(), strict=True)):
+            resp_len = int(resp_len)
+            seq_offset = int(seq_offset)
+            if resp_len > 0:
+                rows_i = torch.arange(seq_offset - resp_len - 1, seq_offset - 1, device=device)
+                rows.append(rows_i)
+                seq_ids.append(torch.full((resp_len,), i, dtype=torch.long, device=device))
+                rel_pos.append(torch.arange(resp_len, dtype=torch.long, device=device))
+                resp_lens.append(torch.full((resp_len,), resp_len, dtype=torch.long, device=device))
+                if rm_values is not None and rm_offsets is not None:
+                    s, e = int(rm_offsets[i].item()), int(rm_offsets[i + 1].item())
+                    valid_i = rm_values[s : min(e, s + resp_len)]
+                    if valid_i.numel() < resp_len:
+                        valid_i = torch.nn.functional.pad(valid_i, (0, resp_len - valid_i.numel()), value=False)
+                    valid.append(valid_i)
+                elif torch.is_tensor(response_mask) and response_mask.dim() >= 2:
+                    valid_i = response_mask[i, :resp_len].to(device=device).bool()
+                    if valid_i.numel() < resp_len:
+                        valid_i = torch.nn.functional.pad(valid_i, (0, resp_len - valid_i.numel()), value=False)
+                    valid.append(valid_i)
+                else:
+                    valid.append(torch.ones(resp_len, dtype=torch.bool, device=device))
+        if not rows:
+            empty_long = torch.empty(0, dtype=torch.long, device=device)
+            return {
+                "rows": empty_long,
+                "seq_ids": empty_long,
+                "rel_pos": empty_long,
+                "valid_mask": torch.empty(0, dtype=torch.bool, device=device),
+                "response_lens_per_token": empty_long,
+                "input_seq_lens": cu_seqlens.diff().to(torch.long),
+            }
+        return {
+            "rows": torch.cat(rows).long(),
+            "seq_ids": torch.cat(seq_ids).long(),
+            "rel_pos": torch.cat(rel_pos).long(),
+            "valid_mask": torch.cat(valid).bool(),
+            "response_lens_per_token": torch.cat(resp_lens).long(),
+            "input_seq_lens": cu_seqlens.diff().to(torch.long),
+        }
+    except Exception as e:  # noqa: BLE001
+        print(f"[LOGPROB_REF] failed to build response indices: {e!r}", flush=True)
+        return None
+
+
+def _selected_logprobs_ref(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    rows: torch.Tensor,
+    chunk_size: int = 64,
+) -> torch.Tensor:
+    """Reference selected-token logprobs without materializing full log_softmax."""
+    out = torch.empty(rows.numel(), device=logits.device, dtype=torch.float32)
+    labels = labels.reshape(-1)
+    for start in range(0, rows.numel(), chunk_size):
+        idx = rows[start : start + chunk_size].long()
+        x = logits.index_select(0, idx).float()
+        y = labels.index_select(0, idx).long()
+        out[start : start + idx.numel()] = x.gather(-1, y[:, None]).squeeze(-1) - torch.logsumexp(x, dim=-1)
+    return out
+
+
+def _selected_logits_probe(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    log_probs_rmpad: torch.Tensor,
+    frame_info: dict[str, torch.Tensor],
+    chunk_size: int = 64,
+    topk: int = 5,
+) -> dict[str, torch.Tensor]:
+    """Per-response-token FSDP logits diagnostics for offline root-cause comparison."""
+    rows = frame_info["rows"].long()
+    labels = labels.reshape(-1)
+    cur_logp = log_probs_rmpad.reshape(-1).detach().index_select(0, rows).float()
+    target_ids = labels.index_select(0, rows).long()
+    ref_logp = torch.empty(rows.numel(), device=logits.device, dtype=torch.float32)
+    target_logits = torch.empty_like(ref_logp)
+    logsumexp = torch.empty_like(ref_logp)
+    topk_ids, topk_logprobs = [], []
+    k = max(1, int(topk))
+    for start in range(0, rows.numel(), chunk_size):
+        idx = rows[start : start + chunk_size].long()
+        x = logits.index_select(0, idx).detach().float()
+        y = labels.index_select(0, idx).long()
+        lse = torch.logsumexp(x, dim=-1)
+        tgt = x.gather(-1, y[:, None]).squeeze(-1)
+        ref_logp[start : start + idx.numel()] = tgt - lse
+        target_logits[start : start + idx.numel()] = tgt
+        logsumexp[start : start + idx.numel()] = lse
+        vals, ids = torch.topk(x - lse[:, None], k=min(k, x.shape[-1]), dim=-1)
+        topk_ids.append(ids.to(torch.long))
+        topk_logprobs.append(vals.to(torch.float32))
+    out = {
+        "rows": rows.detach(),
+        "seq_ids": frame_info["seq_ids"].detach(),
+        "rel_pos": frame_info["rel_pos"].detach(),
+        "valid_mask": frame_info["valid_mask"].detach(),
+        "response_lens_per_token": frame_info["response_lens_per_token"].detach(),
+        "input_seq_lens": frame_info["input_seq_lens"].detach(),
+        "target_ids": target_ids.detach(),
+        "current_log_probs": cur_logp.detach(),
+        "ref_log_probs": ref_logp.detach(),
+        "target_logits": target_logits.detach(),
+        "logsumexp": logsumexp.detach(),
+        "topk_ids": torch.cat(topk_ids, dim=0).detach() if topk_ids else torch.empty(0, k, dtype=torch.long),
+        "topk_logprobs": torch.cat(topk_logprobs, dim=0).detach()
+        if topk_logprobs
+        else torch.empty(0, k, dtype=torch.float32),
+    }
+    return out
+
+
+def _maybe_reference_logprobs(
+    logits_rmpad: torch.Tensor,
+    labels_rmpad: torch.Tensor,
+    log_probs_rmpad: torch.Tensor,
+    input_ids,
+    responses,
+    response_mask,
+) -> tuple[torch.Tensor | None, dict[str, torch.Tensor] | None]:
+    """Compute a torch reference for response-token logprobs, for probe dumps only."""
+    if not _logprob_probe_enabled_on_rank0():
+        return None, None
+    frame_info = _response_frame_info(input_ids, responses, response_mask, logits_rmpad.device)
+    if frame_info is None or frame_info["rows"].numel() == 0:
+        return None, None
+    try:
+        chunk = int(os.getenv("VERL_LOGPROB_PROBE_REF_CHUNK", "64"))
+        topk = int(os.getenv("VERL_LOGPROB_PROBE_TOPK", "5"))
+        diag = _selected_logits_probe(
+            logits=logits_rmpad.detach(),
+            labels=labels_rmpad.detach(),
+            log_probs_rmpad=log_probs_rmpad.detach(),
+            frame_info=frame_info,
+            chunk_size=chunk,
+            topk=topk,
+        )
+        rows = diag["rows"].long()
+        ref_vals = diag["ref_log_probs"]
+        ref_flat = torch.full(log_probs_rmpad.shape, float("nan"), device=log_probs_rmpad.device, dtype=torch.float32)
+        ref_flat[rows.long()] = ref_vals
+        cur_vals = diag["current_log_probs"]
+        diff = (cur_vals - ref_vals).abs()
+        max_diff = float(diff.max().item()) if diff.numel() else 0.0
+        mean_diff = float(diff.mean().item()) if diff.numel() else 0.0
+        if max_diff > float(os.getenv("VERL_LOGPROB_PROBE_REF_PRINT_THR", "0.05")):
+            worst = int(diff.argmax().item())
+            print(
+                "[LOGPROB_REF] current logprobs_from_logits differs from torch reference: "
+                f"mean_abs={mean_diff:.6f} max_abs={max_diff:.6f} "
+                f"flat_row={int(rows[worst].item())} cur={float(cur_vals[worst].item()):.6f} "
+                f"ref={float(ref_vals[worst].item()):.6f}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[LOGPROB_REF] current logprobs_from_logits matches torch reference: "
+                f"mean_abs={mean_diff:.6f} max_abs={max_diff:.6f} n={rows.numel()}",
+                flush=True,
+            )
+        return ref_flat, diag
+    except Exception as e:  # noqa: BLE001
+        print(f"[LOGPROB_REF] reference computation failed: {e!r}", flush=True)
+        return None, None
+
+
+def _normalize_param_name(name: str) -> str:
+    for part in ("module.", "_fsdp_wrapped_module.", "_orig_mod."):
+        name = name.replace(part, "")
+    return name
+
+
+def _model_param_fingerprint(module) -> list[dict]:
+    """Cheap global parameter stats to tell whether dump-FSDP weights match fresh HF."""
+    if not _logprob_probe_enabled_on_rank0():
+        return []
+    patterns = [
+        p.strip()
+        for p in os.getenv(
+            "VERL_LOGPROB_PROBE_PARAM_PATTERNS",
+            "embed_tokens.weight,input_layernorm.weight,post_attention_layernorm.weight,q_proj.weight,o_proj.weight",
+        ).split(",")
+        if p.strip()
+    ]
+    max_items = int(os.getenv("VERL_LOGPROB_PROBE_PARAM_MAX", "12"))
+    max_numel = int(os.getenv("VERL_LOGPROB_PROBE_PARAM_MAX_NUMEL", "20000000"))
+    selected = []
+    try:
+        for name, param in module.named_parameters():
+            norm = _normalize_param_name(name)
+            if not any(p in norm for p in patterns):
+                continue
+            local = param.detach()
+            if isinstance(local, DTensor):
+                local = local.to_local()
+            if local.numel() == 0 or local.numel() > max_numel:
+                continue
+            selected.append((norm, local))
+            if len(selected) >= max_items:
+                break
+        if not selected:
+            for name, param in module.named_parameters():
+                norm = _normalize_param_name(name)
+                local = param.detach()
+                if isinstance(local, DTensor):
+                    local = local.to_local()
+                if local.numel() and local.numel() <= max_numel:
+                    selected.append((norm, local))
+                if len(selected) >= max_items:
+                    break
+        out = []
+        for name, local in selected:
+            x = local.float()
+            stats = torch.tensor(
+                [
+                    float(x.numel()),
+                    float(x.sum().item()),
+                    float((x * x).sum().item()),
+                    float(x.abs().max().item()) if x.numel() else 0.0,
+                ],
+                device=x.device,
+                dtype=torch.float64,
+            )
+            out.append(
+                {
+                    "name": name,
+                    "local_numel": int(stats[0].item()),
+                    "local_sum": float(stats[1].item()),
+                    "local_sqsum": float(stats[2].item()),
+                    "local_absmax": float(stats[3].item()),
+                    "dtype": str(local.dtype),
+                    "local_shape": tuple(local.shape),
+                }
+            )
+        return out
+    except Exception as e:  # noqa: BLE001
+        print(f"[LOGPROB_PROBE] param fingerprint failed: {e!r}", flush=True)
+        return []
+
+
+def _maybe_dump_logprob_probe(micro_batch, model_output, module=None) -> None:
+    if not _logprob_probe_dump_enabled():
         return
     cap = int(os.getenv("VERL_LOGPROB_PROBE_MAX", "1"))
     if _LOGPROB_PROBE_DONE[0] >= cap:
@@ -197,6 +477,7 @@ def _maybe_dump_logprob_probe(micro_batch, model_output) -> None:
     # and reproduce ~0 gap offline). Default 0.05 ~ the observed masked seq-mean-k3; raise to chase the
     # tail. Set VERL_LOGPROB_PROBE_MIN_K3=0 to dump the first batch unconditionally.
     min_k3 = float(os.getenv("VERL_LOGPROB_PROBE_MIN_K3", "0.05"))
+    cur_k3 = None
     if min_k3 > 0:
         try:
             from verl.trainer.ppo.core_algos import get_probe_maxk3
@@ -209,17 +490,30 @@ def _maybe_dump_logprob_probe(micro_batch, model_output) -> None:
         print(f"[LOGPROB_PROBE] masked batch found (max seq_mean_k3={cur_k3:.5f} >= {min_k3}) -> dumping", flush=True)
     try:
 
-        def _unnest(x):
+        def _cpuify(x):
             # Convert a (possibly nested / DTensor) tensor to a plain CPU tensor + optional offsets.
             if x is None:
                 return None
+            if hasattr(x, "data") and x.__class__.__name__ == "NonTensorData":
+                return _cpuify(x.data)
+            if x.__class__.__name__ == "NonTensorStack":
+                try:
+                    return [_cpuify(v.data if hasattr(v, "data") else v) for v in x.tolist()]
+                except Exception:  # noqa: BLE001
+                    return str(x)
             if hasattr(x, "offsets") and callable(getattr(x, "offsets", None)):
                 try:
                     return {"values": x.values().detach().cpu(), "offsets": x.offsets().detach().cpu()}
                 except Exception:  # noqa: BLE001
                     pass
+            if isinstance(x, DTensor):
+                x = x.to_local()
             if torch.is_tensor(x):
                 return x.detach().cpu()
+            if isinstance(x, dict):
+                return {k: _cpuify(v) for k, v in x.items()}
+            if isinstance(x, list | tuple):
+                return [_cpuify(v) for v in x]
             return x
 
         mm = extract_multi_modal_inputs(micro_batch.get("multi_modal_inputs", []))
@@ -228,16 +522,26 @@ def _maybe_dump_logprob_probe(micro_batch, model_output) -> None:
         # risks stalling training). The dumped pixel_values + image_grid_thw fully determine the model-seen
         # image, so the offline analyzer reconstructs the image from them for a fresh vLLM(D) replay.
         bundle = {
-            "input_ids": _unnest(micro_batch.get("input_ids")),
-            "position_ids": _unnest(micro_batch.get("position_ids")),
-            "responses": _unnest(micro_batch.get("responses")),
-            "response_mask": _unnest(micro_batch.get("response_mask")),
-            "old_log_probs": _unnest(micro_batch.get("old_log_probs")),  # vLLM logp (bypass_mode)
-            "rollout_log_probs": _unnest(micro_batch.get("rollout_log_probs")),
-            "temperature": _unnest(micro_batch.get("temperature")),
-            "fsdp_log_probs": _unnest(model_output.get("log_probs")) if isinstance(model_output, dict) else None,
-            "pixel_values": _unnest(mm.get("pixel_values")) if mm else None,
-            "image_grid_thw": _unnest(mm.get("image_grid_thw")) if mm else None,
+            "input_ids": _cpuify(micro_batch.get("input_ids")),
+            "position_ids": _cpuify(micro_batch.get("position_ids")),
+            "responses": _cpuify(micro_batch.get("responses")),
+            "response_mask": _cpuify(micro_batch.get("response_mask")),
+            "old_log_probs": _cpuify(micro_batch.get("old_log_probs")),  # vLLM logp (bypass_mode)
+            "rollout_log_probs": _cpuify(micro_batch.get("rollout_log_probs")),
+            "temperature": _cpuify(micro_batch.get("temperature")),
+            "probe_maxk3": cur_k3,
+            "trainer_global_steps": _cpuify(micro_batch.get("trainer_global_steps")),
+            "probe_batch_keys": _cpuify(micro_batch.get("probe_batch_keys")),
+            "probe_batch_tags": _cpuify(micro_batch.get("probe_batch_tags")),
+            "probe_parameter_sync_step": _cpuify(micro_batch.get("probe_parameter_sync_step")),
+            "fsdp_log_probs": _cpuify(model_output.get("log_probs")) if isinstance(model_output, dict) else None,
+            "fsdp_log_probs_ref": _cpuify(model_output.get("log_probs_ref"))
+            if isinstance(model_output, dict)
+            else None,
+            "fsdp_probe": _cpuify(model_output.get("logprob_probe")) if isinstance(model_output, dict) else None,
+            "fsdp_param_fingerprint": _model_param_fingerprint(module) if module is not None else [],
+            "pixel_values": _cpuify(mm.get("pixel_values")) if mm else None,
+            "image_grid_thw": _cpuify(mm.get("image_grid_thw")) if mm else None,
             # rollout ENGINE logprobs_mode (raw vs processed); needed for a faithful fresh-vLLM(D) replay so
             # |A-D| matches. Read from env (launch script should set it to the rollout config's actual value).
             "logprobs_mode": os.getenv("VERL_LOGPROB_PROBE_LOGPROBS_MODE", "processed_logprobs"),
@@ -1351,6 +1655,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
             )
 
         model_output = {}
+        log_probs_ref = None
+        logprob_probe = None
 
         input_ids = micro_batch["input_ids"]
 
@@ -1390,6 +1696,23 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     labels=input_ids_rmpad_rolled,
                     inplace_backward=inplace_backward,
                 )
+                if not self.use_ulysses_sp:
+                    log_probs_ref, logprob_probe = _maybe_reference_logprobs(
+                        logits_rmpad=logits_rmpad,
+                        labels_rmpad=input_ids_rmpad_rolled,
+                        log_probs_rmpad=log_probs,
+                        input_ids=input_ids,
+                        responses=micro_batch.get("responses"),
+                        response_mask=micro_batch.get("response_mask"),
+                    )
+                    if logprob_probe is not None:
+                        logprob_probe["path"] = {
+                            "use_remove_padding": True,
+                            "use_fused_kernels": False,
+                            "use_ulysses_sp": False,
+                            "pad_mode": str(pad_mode),
+                            "logits_available": True,
+                        }
 
                 # compute entropy
                 if calculate_entropy:
@@ -1452,6 +1775,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 cu_seqlens = input_ids.offsets()
                 # (bsz, j1), for each sample, is the length of each sample: [real_prompt length + real_response length]
                 log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)
+                if log_probs_ref is not None:
+                    log_probs_ref = torch.nested.nested_tensor_from_jagged(log_probs_ref, cu_seqlens)
                 if calculate_entropy:
                     entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
                 if calculate_sum_pi_squared:
@@ -1501,6 +1826,22 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     logits_rmpad = torch.cat([t for t in logits.unbind()])
                     input_ids_rmpad_rolled = output_args["input_ids_rmpad_rolled"]
                     log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
+                    log_probs_ref, logprob_probe = _maybe_reference_logprobs(
+                        logits_rmpad=logits_rmpad,
+                        labels_rmpad=input_ids_rmpad_rolled,
+                        log_probs_rmpad=log_probs,
+                        input_ids=input_ids,
+                        responses=micro_batch.get("responses"),
+                        response_mask=micro_batch.get("response_mask"),
+                    )
+                    if logprob_probe is not None:
+                        logprob_probe["path"] = {
+                            "use_remove_padding": False,
+                            "use_fused_kernels": False,
+                            "use_ulysses_sp": False,
+                            "pad_mode": str(pad_mode),
+                            "logits_available": True,
+                        }
 
                     # Mirror the use_remove_padding=True branch (see verl#6293).
                     # No Ulysses SP gather here: this branch is the no-SP path
@@ -1532,6 +1873,21 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
         model_output["log_probs"] = log_probs
+        if log_probs_ref is not None:
+            model_output["log_probs_ref"] = log_probs_ref
+        if logprob_probe is None and _logprob_probe_enabled_on_rank0():
+            logprob_probe = {
+                "path": {
+                    "use_remove_padding": bool(use_remove_padding),
+                    "use_fused_kernels": bool(use_fused_kernels),
+                    "use_ulysses_sp": bool(self.use_ulysses_sp),
+                    "pad_mode": str(pad_mode),
+                    "logits_available": False,
+                },
+                "reason": "selected-logit probe unavailable on this FSDP branch",
+            }
+        if logprob_probe is not None:
+            model_output["logprob_probe"] = logprob_probe
         if calculate_entropy:
             model_output["entropy"] = entropy
         if calculate_sum_pi_squared:
@@ -1571,7 +1927,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 )
                 # AFTER the loss: the loss has stashed this batch's max seq-mean-k3, so the probe can
                 # gate on it and dump only a MASKED batch (see _maybe_dump_logprob_probe).
-                _maybe_dump_logprob_probe(micro_batch, model_output)
+                _maybe_dump_logprob_probe(micro_batch, model_output, module=self.module)
             else:
                 assert forward_only, "forward_only must be True when loss_function is None"
                 loss = torch.tensor(1.0, device=device_name)
