@@ -192,11 +192,11 @@ def _maybe_dump_logprob_probe(micro_batch, model_output) -> None:
         rank = 0
     if rank != 0:
         return
-    # k3 gate: only dump a micro-batch that actually trips the RS mask (max per-seq mean-k3 > thr),
-    # so we capture a MASKED batch, not the first (often unmasked) one. thr default 0.005 == the RS mask
-    # threshold, i.e. dump any batch with a seq whose vLLM<->FSDP kl (k3) exceeds the mask cutoff;
-    # set VERL_LOGPROB_PROBE_MIN_K3=0 to dump the first batch unconditionally.
-    min_k3 = float(os.getenv("VERL_LOGPROB_PROBE_MIN_K3", "0.005"))
+    # k3 gate: only dump a micro-batch whose max per-seq mean-k3 exceeds thr, so we capture a GENUINELY
+    # divergent batch rather than one grazing the 0.005 mask floor (early low-gap batches barely cross it
+    # and reproduce ~0 gap offline). Default 0.05 ~ the observed masked seq-mean-k3; raise to chase the
+    # tail. Set VERL_LOGPROB_PROBE_MIN_K3=0 to dump the first batch unconditionally.
+    min_k3 = float(os.getenv("VERL_LOGPROB_PROBE_MIN_K3", "0.05"))
     if min_k3 > 0:
         try:
             from verl.trainer.ppo.core_algos import get_probe_maxk3
@@ -223,19 +223,10 @@ def _maybe_dump_logprob_probe(micro_batch, model_output) -> None:
             return x
 
         mm = extract_multi_modal_inputs(micro_batch.get("multi_modal_inputs", []))
-        # RAW images per sequence (carried through only when the probe is on; see agent_loop._postprocess),
-        # so the microbench can recompute a FRESH vLLM(D) on the exact same images. Each entry is the list
-        # of PIL images for that sequence; aligned 1:1 with the sequences in input_ids.
-        raw_images = None
-        mmd = micro_batch.get("multi_modal_data")
-        if mmd is not None:
-            from tensordict.tensorclass import NonTensorData
-
-            raw_images = []
-            for s in mmd:  # NonTensorStack -> yields NonTensorData wrapping the per-sample dict
-                s = s.data if isinstance(s, NonTensorData) else s
-                imgs = s.get("images") if isinstance(s, dict) else None
-                raw_images.append(imgs or [])
+        # TRAINER-SIDE dump only: raw PIL images are NOT available here (the dedup pipeline discards them and
+        # only resolved pixel_values reach the actor). We do NOT pull raw images from the rollouter (that path
+        # risks stalling training). The dumped pixel_values + image_grid_thw fully determine the model-seen
+        # image, so the offline analyzer reconstructs the image from them for a fresh vLLM(D) replay.
         bundle = {
             "input_ids": _unnest(micro_batch.get("input_ids")),
             "position_ids": _unnest(micro_batch.get("position_ids")),
@@ -247,10 +238,8 @@ def _maybe_dump_logprob_probe(micro_batch, model_output) -> None:
             "fsdp_log_probs": _unnest(model_output.get("log_probs")) if isinstance(model_output, dict) else None,
             "pixel_values": _unnest(mm.get("pixel_values")) if mm else None,
             "image_grid_thw": _unnest(mm.get("image_grid_thw")) if mm else None,
-            "raw_images": raw_images,  # list[n_seq] of list[PIL] for fresh-vLLM(D) recompute
             # rollout ENGINE logprobs_mode (raw vs processed); needed for a faithful fresh-vLLM(D) replay so
-            # |A-D| matches. Not available at the actor forward -> read from env (launch script should set it
-            # to the rollout config's actual value); default matches verl's rollout default.
+            # |A-D| matches. Read from env (launch script should set it to the rollout config's actual value).
             "logprobs_mode": os.getenv("VERL_LOGPROB_PROBE_LOGPROBS_MODE", "processed_logprobs"),
             "model_path": os.getenv("VERL_LOGPROB_DEBUG_TOKENIZER", ""),
         }

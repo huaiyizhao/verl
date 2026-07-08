@@ -1158,17 +1158,6 @@ class AgentLoopWorker:
         if any(mmi is not None for mmi in multi_modal_inputs_list):
             non_tensor_batch["multi_modal_inputs"] = np.array(multi_modal_inputs_list, dtype=object)
 
-        # RAW images for the logprob probe: normally dropped here (only resolved pixel_values flow to the
-        # actor). When the probe is on, carry per-sample multi_modal_data (raw PIL images) through to the
-        # actor micro-batch so _maybe_dump_logprob_probe can save them and the microbench can recompute a
-        # FRESH vLLM(D). Gated by VERL_LOGPROB_PROBE_DUMP so normal training pays zero extra memory.
-        if os.getenv("VERL_LOGPROB_PROBE_DUMP", "0") not in ("0", "false", "False", ""):
-            mmd_list = [input.multi_modal_data for input in inputs]
-            if any(mmd for mmd in mmd_list):
-                mmd_arr = np.empty(len(inputs), dtype=object)
-                mmd_arr[:] = mmd_list
-                non_tensor_batch["multi_modal_data"] = mmd_arr
-
         metrics = [input.metrics.model_dump() for input in inputs]
         # Collect extra fields from all inputs and convert them to np.ndarray
         # Keep a stable set of keys so downstream batch concat stays consistent across agent loops.
