@@ -321,6 +321,7 @@ class RolloutAgentLoopWorkerTQ(AgentLoopWorker):
         rollout.n sampling id; index: agent-loop output index.
         """
         uid, session_id = kwargs["uid"], kwargs["session_id"]
+        rollout_group_id = f"{uid}_{session_id}"
         keys, fields, tags = [], [], []
         t_mm = t_pos = 0.0  # processing-time profiling accumulators
         for i, output in enumerate(outputs):
@@ -372,6 +373,9 @@ class RolloutAgentLoopWorkerTQ(AgentLoopWorker):
             tags.append(
                 {
                     "status": "success",
+                    "trajectory_role": "final" if i == len(outputs) - 1 else "intermediate",
+                    "rollout_group_id": rollout_group_id,
+                    "turn_number": i,
                     "prompt_len": prompt_len,
                     "response_len": response_len,
                     "seq_len": prompt_len + response_len,

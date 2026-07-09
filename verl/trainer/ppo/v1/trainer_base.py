@@ -1219,6 +1219,81 @@ class PPOTrainer(ABC):
         metrics.update(global_balance_stats)
         return batch
 
+    @staticmethod
+    def _expanded_rollout_batch_info(batch: KVBatchMeta) -> dict[str, float | int] | None:
+        """Return row/group stats when GUI rollout rows carry async-style group tags.
+
+        In the GUI multi-turn path one rollout/session can be expanded into several
+        training rows. Async keeps those expanded rows as one PPO mini-batch; v1
+        used to treat ``ppo_mini_batch_size * rollout.n`` as a row count and thus
+        could perform multiple optimizer steps inside one sampled rollout batch.
+        """
+        tags = batch.tags or []
+        if not tags:
+            return None
+
+        group_counts: dict[str, int] = defaultdict(int)
+        valid_rows = 0
+        for tag in tags:
+            if tag.get("is_padding", False):
+                continue
+            group_id = tag.get("rollout_group_id")
+            if group_id is None:
+                return None
+            valid_rows += 1
+            group_counts[str(group_id)] += 1
+
+        if valid_rows == 0 or not group_counts:
+            return None
+
+        rows_per_group = list(group_counts.values())
+        return {
+            "row_mini_batch_size": len(batch.keys),
+            "valid_rows": valid_rows,
+            "num_rollout_groups": len(group_counts),
+            "rows_per_group_mean": float(sum(rows_per_group)) / len(rows_per_group),
+            "rows_per_group_max": max(rows_per_group),
+        }
+
+    def _resolve_update_batch_sizes(
+        self,
+        batch: KVBatchMeta,
+        configured_rollout_mini_batch_size: int,
+        metrics: dict,
+        prefix: str,
+    ) -> tuple[int, int]:
+        """Choose global/mini batch sizes, matching async for expanded GUI rows."""
+        expanded = self._expanded_rollout_batch_info(batch)
+        if expanded is None:
+            return configured_rollout_mini_batch_size, configured_rollout_mini_batch_size
+
+        row_mini_batch_size = int(expanded["row_mini_batch_size"])
+        valid_rows = int(expanded["valid_rows"])
+        num_rollout_groups = int(expanded["num_rollout_groups"])
+        metrics.update(
+            {
+                f"{prefix}/expanded_rollout/rows": float(row_mini_batch_size),
+                f"{prefix}/expanded_rollout/valid_rows": float(valid_rows),
+                f"{prefix}/expanded_rollout/rollout_groups": float(num_rollout_groups),
+                f"{prefix}/expanded_rollout/rows_per_group_mean": float(expanded["rows_per_group_mean"]),
+                f"{prefix}/expanded_rollout/rows_per_group_max": float(expanded["rows_per_group_max"]),
+                f"{prefix}/expanded_rollout/configured_rollout_mini_batch_size": float(
+                    configured_rollout_mini_batch_size
+                ),
+            }
+        )
+        if num_rollout_groups > configured_rollout_mini_batch_size:
+            logger.warning(
+                "[%s] expanded GUI batch has %d rollout groups > configured rollout mini-batch %d; "
+                "using the whole expanded row batch (%d rows) for one optimizer update to avoid "
+                "splitting turns from the same rollout.",
+                prefix,
+                num_rollout_groups,
+                configured_rollout_mini_batch_size,
+                row_mini_batch_size,
+            )
+        return max(valid_rows, 1), row_mini_batch_size
+
     def _compute_old_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the old log prob of the batch."""
         # Operating Mode Selection:
@@ -1438,9 +1513,12 @@ class PPOTrainer(ABC):
         """Update the critic network."""
         ppo_mini_batch_size = self.config.critic.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        global_batch_size, mini_batch_size = self._resolve_update_batch_sizes(
+            batch, ppo_mini_batch_size, metrics, "critic"
+        )
         extra_info = {
-            "global_batch_size": ppo_mini_batch_size,
-            "mini_batch_size": ppo_mini_batch_size,
+            "global_batch_size": global_batch_size,
+            "mini_batch_size": mini_batch_size,
             "epochs": self.config.critic.ppo_epochs,
             "seed": self.config.critic.data_loader_seed,
             "dataloader_kwargs": {"shuffle": self.config.critic.shuffle},
@@ -1461,6 +1539,9 @@ class PPOTrainer(ABC):
         """Update the actor network."""
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        global_batch_size, mini_batch_size = self._resolve_update_batch_sizes(
+            batch, ppo_mini_batch_size, metrics, "actor"
+        )
         calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
             self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
         )
@@ -1472,8 +1553,8 @@ class PPOTrainer(ABC):
         extra_info = {
             "calculate_entropy": calculate_entropy,
             "distillation_use_topk": distillation_use_topk,
-            "global_batch_size": ppo_mini_batch_size,
-            "mini_batch_size": ppo_mini_batch_size,
+            "global_batch_size": global_batch_size,
+            "mini_batch_size": mini_batch_size,
             "epochs": self.config.actor_rollout_ref.actor.ppo_epochs,
             "seed": self.config.actor_rollout_ref.actor.data_loader_seed,
             "dataloader_kwargs": {"shuffle": self.config.actor_rollout_ref.actor.shuffle},

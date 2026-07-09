@@ -157,6 +157,7 @@ class _ImageDedupWorkerTQ(_PlainAgentLoopWorkerTQ):
         """
         uid, session_id = kwargs["uid"], kwargs["session_id"]
         namespace = f"{uid}_{session_id}"
+        rollout_group_id = namespace
         image_payloads: dict[str, dict] = {}
         keys, fields, tags = [], [], []
         t_mm = t_pos = t_split = 0.0  # processing-time profiling accumulators
@@ -219,6 +220,9 @@ class _ImageDedupWorkerTQ(_PlainAgentLoopWorkerTQ):
             tags.append(
                 {
                     "status": "success",
+                    "trajectory_role": "final" if i == len(outputs) - 1 else "intermediate",
+                    "rollout_group_id": rollout_group_id,
+                    "turn_number": i,
                     "prompt_len": prompt_len,
                     "response_len": response_len,
                     "seq_len": prompt_len + response_len,
