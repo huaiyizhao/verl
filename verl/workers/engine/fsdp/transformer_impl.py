@@ -1928,6 +1928,12 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 # AFTER the loss: the loss has stashed this batch's max seq-mean-k3, so the probe can
                 # gate on it and dump only a MASKED batch (see _maybe_dump_logprob_probe).
                 _maybe_dump_logprob_probe(micro_batch, model_output, module=self.module)
+                # Diagnostic-only objects are not valid postprocess outputs: postprocess_batch_func
+                # expects every model_output value to be a nested tensor and calls .unbind().
+                # Keep them out of the training return path after the one-shot dump has had a chance
+                # to consume them.
+                model_output.pop("logprob_probe", None)
+                model_output.pop("log_probs_ref", None)
             else:
                 assert forward_only, "forward_only must be True when loss_function is None"
                 loss = torch.tensor(1.0, device=device_name)
