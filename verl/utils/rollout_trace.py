@@ -384,27 +384,130 @@ def _collect_images_as_content_parts(obj, _depth=0, _parts=None):
     return _parts
 
 
-def _strip_images(obj, _depth=0):
-    """Return ``obj`` with PIL images removed (rendered separately as image_url parts)."""
+_TOKEN_ID_FIELDS = {
+    "input_ids",
+    "output_ids",
+    "prompt_ids",
+    "response_ids",
+    "token_ids",
+}
+
+
+def _token_ids_to_list(token_ids):
+    if token_ids is None or isinstance(token_ids, str | bytes):
+        return None
+    if hasattr(token_ids, "detach"):
+        token_ids = token_ids.detach().cpu()
+    if hasattr(token_ids, "tolist"):
+        token_ids = token_ids.tolist()
+    if isinstance(token_ids, tuple):
+        token_ids = list(token_ids)
+    if not isinstance(token_ids, list):
+        return None
+    if token_ids and isinstance(token_ids[0], list | tuple):
+        return None
+    try:
+        return [int(x) for x in token_ids]
+    except (TypeError, ValueError):
+        return None
+
+
+def _summarize_token_ids(value):
+    ids = _token_ids_to_list(value)
+    if ids is None:
+        return value
+    return {"num_token_ids": len(ids), "head": ids[:8], "tail": ids[-8:] if len(ids) > 8 else []}
+
+
+def _extract_reward(payload):
+    walk = _as_walkable(payload)
+    if not isinstance(walk, dict):
+        return None
+    if walk.get("reward") is not None:
+        return walk["reward"]
+    if walk.get("reward_score") is not None:
+        return walk["reward_score"]
+    extra_fields = walk.get("extra_fields")
+    if isinstance(extra_fields, dict):
+        if extra_fields.get("reward") is not None:
+            return extra_fields["reward"]
+        reward_extra = extra_fields.get("reward_extra_info")
+        if isinstance(reward_extra, dict) and reward_extra.get("reward") is not None:
+            return reward_extra["reward"]
+    return None
+
+
+def _strip_images_and_summarize_tokens(obj, _depth=0):
+    """Return ``obj`` with PIL images removed and large token-id arrays summarized."""
     if _depth > 12:
         return repr(obj)
     if _is_pil_image(obj):
         return None
     walk = _as_walkable(obj)
     if isinstance(walk, dict):
-        return {k: _strip_images(v, _depth + 1) for k, v in walk.items()}
+        out = {}
+        for k, v in walk.items():
+            if k in _TOKEN_ID_FIELDS:
+                out[k] = _summarize_token_ids(v)
+            else:
+                out[k] = _strip_images_and_summarize_tokens(v, _depth + 1)
+        return out
     if isinstance(walk, list | tuple):
-        return [_strip_images(v, _depth + 1) for v in walk]
+        return [_strip_images_and_summarize_tokens(v, _depth + 1) for v in walk]
     return walk
 
 
+def _append_text_fields(payload, lines: list[str], _depth=0):
+    if _depth > 8:
+        return
+    walk = _as_walkable(payload)
+    if isinstance(walk, dict):
+        reward = _extract_reward(walk)
+        if reward is not None:
+            lines.append(f"reward: {reward}")
+        for key in ("prompt_text", "response_text", "answer", "text"):
+            value = walk.get(key)
+            if isinstance(value, str) and value:
+                lines.append(f"{key}:\n{value}")
+        extra_fields = walk.get("extra_fields")
+        if isinstance(extra_fields, dict):
+            reward_extra = extra_fields.get("reward_extra_info")
+            if isinstance(reward_extra, dict) and reward_extra:
+                try:
+                    lines.append("reward_extra_info:\n" + json.dumps(reward_extra, ensure_ascii=False, indent=2))
+                except Exception:
+                    lines.append(f"reward_extra_info:\n{reward_extra!r}")
+        for key, value in walk.items():
+            if key in _TOKEN_ID_FIELDS:
+                continue
+            if isinstance(_as_walkable(value), dict | list | tuple):
+                _append_text_fields(value, lines, _depth + 1)
+    elif isinstance(walk, list | tuple):
+        for idx, item in enumerate(walk):
+            before = len(lines)
+            _append_text_fields(item, lines, _depth + 1)
+            if len(lines) > before:
+                lines.insert(before, f"[item {idx}]")
+
+
 def _to_mlflow_chat_messages(payload, *, role: str) -> dict:
-    """Wrap a payload into MLflow's OpenAI chat schema: JSON text part + one image_url per image."""
+    """Wrap a payload into MLflow's OpenAI chat schema.
+
+    Put decoded text/reward first so the MLflow Chat tab is readable. The full
+    structured payload is still present below it, but bulky token-id arrays are
+    summarized instead of overwhelming the trace with raw ids.
+    """
     image_parts = _collect_images_as_content_parts(payload)
+    display_lines: list[str] = []
+    _append_text_fields(payload, display_lines)
     try:
-        text = json.dumps(_strip_images(payload), default=repr, ensure_ascii=False, indent=2)
+        metadata = json.dumps(_strip_images_and_summarize_tokens(payload), default=repr, ensure_ascii=False, indent=2)
     except Exception:
-        text = repr(payload)
+        metadata = repr(payload)
+    if display_lines:
+        text = "\n\n".join(display_lines) + "\n\nmetadata:\n" + metadata
+    else:
+        text = metadata
     content_parts: list = [{"type": "text", "text": text}]
     content_parts.extend(image_parts)
     return {"messages": [{"role": role, "content": content_parts}]}
@@ -444,18 +547,30 @@ def rollout_trace_op(func):
                 return result
             loop = get_event_loop()
             if hasattr(result, "prompt_ids"):
+                prompt_ids = _token_ids_to_list(result.prompt_ids)
+                if prompt_ids is None:
+                    prompt_ids = result.prompt_ids
                 _result["prompt_text"] = await loop.run_in_executor(
-                    None, guard_stop_iteration(lambda: tokenizer.decode(result.prompt_ids))
+                    None, guard_stop_iteration(lambda: tokenizer.decode(prompt_ids))
                 )
             if hasattr(result, "response_ids"):
+                response_ids = _token_ids_to_list(result.response_ids)
+                if response_ids is None:
+                    response_ids = result.response_ids
                 _result["response_text"] = await loop.run_in_executor(
-                    None, guard_stop_iteration(lambda: tokenizer.decode(result.response_ids))
+                    None, guard_stop_iteration(lambda: tokenizer.decode(response_ids))
                 )
             # TokenOutput (generate): token_ids holds the response tokens.
             if hasattr(result, "token_ids") and not hasattr(result, "prompt_ids"):
+                token_ids = _token_ids_to_list(result.token_ids)
+                if token_ids is None:
+                    token_ids = result.token_ids
                 _result["response_text"] = await loop.run_in_executor(
-                    None, guard_stop_iteration(lambda: tokenizer.decode(result.token_ids))
+                    None, guard_stop_iteration(lambda: tokenizer.decode(token_ids))
                 )
+            reward = _extract_reward(_result)
+            if reward is not None and "reward" not in _result:
+                _result["reward"] = reward
             return _result
 
         async def add_token2text_to_inputs(self, inputs_dict):
@@ -464,7 +579,8 @@ def rollout_trace_op(func):
             if tokenizer is None or not hasattr(tokenizer, "decode"):
                 return inputs_dict
             prompt_ids = inputs_dict.get("prompt_ids")
-            if isinstance(prompt_ids, list | tuple) and len(prompt_ids) > 0:
+            prompt_ids = _token_ids_to_list(prompt_ids)
+            if prompt_ids is not None and len(prompt_ids) > 0:
                 loop = get_event_loop()
                 prompt_text = await loop.run_in_executor(
                     None, guard_stop_iteration(lambda: tokenizer.decode(prompt_ids))

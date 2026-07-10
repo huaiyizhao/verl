@@ -423,6 +423,7 @@ class PPOTrainer(ABC):
         if self.reward_loop_manager.reward_loop_worker_handles is None:
             with marked_timer("reward", timing_raw, color="yellow"):
                 batch = self._compute_reward_colocate(batch, metrics=metrics)
+        self._record_prompt_reward_before_expand(batch, metrics)
 
         # 4. balance batch across data parallel groups
         batch = self._balance_batch(batch, metrics=metrics)
@@ -1167,6 +1168,63 @@ class PPOTrainer(ABC):
         )
 
         return batch
+
+    def _record_prompt_reward_before_expand(self, batch: KVBatchMeta, metrics: dict) -> None:
+        """Record reward before DP balancing/padding and before expanded rows affect metrics.
+
+        GUI rollouts can emit multiple rows for one rollout session. The reward
+        is an episode-level scalar shared by those rows, so this metric first
+        deduplicates by rollout/session and then reports the async-compatible
+        rollout mean plus a true prompt-level mean.
+        """
+        try:
+            data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=["rm_scores"])
+            rm_scores = data.to_padded_tensor()["rm_scores"]
+        except Exception:
+            logger.debug("Skip reward/sample_mean_before_expand: rm_scores are not available", exc_info=True)
+            return
+
+        sequence_rewards = rm_scores.detach().float().sum(dim=-1).cpu()
+        rollout_rewards: dict[str, float] = {}
+        rollout_prompt: dict[str, str] = {}
+        tags = batch.tags or [{} for _ in batch.keys]
+        for i, key in enumerate(batch.keys):
+            if i >= sequence_rewards.numel():
+                break
+            tag = tags[i] if i < len(tags) and isinstance(tags[i], dict) else {}
+            if tag.get("is_padding", False):
+                continue
+            reward = float(sequence_rewards[i].item())
+            if not math.isfinite(reward):
+                continue
+
+            key_str = str(key)
+            parts = key_str.rsplit("_", 2)
+            if len(parts) == 3:
+                prompt_key, session_id, _ = parts
+                fallback_rollout_key = f"{prompt_key}_{session_id}"
+            else:
+                prompt_key = key_str
+                fallback_rollout_key = key_str
+            rollout_key = str(tag.get("rollout_group_id", fallback_rollout_key))
+            rollout_rewards[rollout_key] = reward
+            rollout_prompt[rollout_key] = prompt_key
+
+        if not rollout_rewards:
+            return
+
+        rollout_values = list(rollout_rewards.values())
+        sample_mean = float(sum(rollout_values) / len(rollout_values))
+        prompt_to_rewards: dict[str, list[float]] = defaultdict(list)
+        for rollout_key, reward in rollout_rewards.items():
+            prompt_to_rewards[rollout_prompt[rollout_key]].append(reward)
+        prompt_means = [sum(rewards) / len(rewards) for rewards in prompt_to_rewards.values() if rewards]
+        prompt_mean = float(sum(prompt_means) / len(prompt_means)) if prompt_means else sample_mean
+
+        metrics["reward/sample_mean_before_expand"] = sample_mean
+        metrics["reward/prompt_mean_before_expand"] = prompt_mean
+        metrics["reward/num_rollouts_before_expand"] = float(len(rollout_rewards))
+        metrics["reward/num_prompts_before_expand"] = float(len(prompt_to_rewards))
 
     @staticmethod
     def _lengths_to_mask(lengths: torch.Tensor, width: int) -> torch.Tensor:

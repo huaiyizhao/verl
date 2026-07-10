@@ -205,6 +205,7 @@ def hf_processor(name_or_path, **kwargs):
         # Bind vlm model's get_rope_index method to processor.
         processor.config = config
         model_class = None
+        model_type = getattr(config, "model_type", None)
         match processor.__class__.__name__:
             case "Qwen2VLProcessor":
                 from transformers.models.qwen2_vl import Qwen2VLModel
@@ -215,9 +216,18 @@ def hf_processor(name_or_path, **kwargs):
 
                 model_class = Qwen2_5_VLModel
             case "Qwen3VLProcessor":
-                from transformers.models.qwen3_vl import Qwen3VLModel
+                if model_type == "qwen3_5":
+                    from transformers.models.qwen3_5 import Qwen3_5Model
 
-                model_class = Qwen3VLModel
+                    model_class = Qwen3_5Model
+                elif model_type == "qwen3_5_moe":
+                    from transformers.models.qwen3_5_moe import Qwen3_5MoeModel
+
+                    model_class = Qwen3_5MoeModel
+                else:
+                    from transformers.models.qwen3_vl import Qwen3VLModel
+
+                    model_class = Qwen3VLModel
             case "Glm4vImageProcessor":
                 from transformers.models.glm4v import Glm4vModel
 
