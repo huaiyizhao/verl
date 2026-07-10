@@ -56,6 +56,7 @@ from verl.trainer.ppo.v1.agent_loop_tq_rollout import (
     mm_token_feature_counts,
 )
 from verl.trainer.ppo.v1.replay_buffer_session import SessionReplayBuffer
+from verl.utils.executor_guard import guard_stop_iteration
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 from verl.utils.transferqueue_image_dedup import (
     IMAGE_IDS_KEY,
@@ -110,7 +111,8 @@ class _ImageDedupWorkerTQ(_PlainAgentLoopWorkerTQ):
         # concurrent rollouts on this worker are not blocked; the TQ puts stay async.
         loop = asyncio.get_running_loop()
         keys, fields, tags, image_payloads, timing = await loop.run_in_executor(
-            self._postproc_pool, self._build_rows_dedup, outputs, kwargs, validate
+            self._postproc_pool,
+            guard_stop_iteration(lambda: self._build_rows_dedup(outputs, kwargs, validate)),
         )
 
         t_img_put = 0.0

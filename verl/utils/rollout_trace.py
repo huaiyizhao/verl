@@ -24,6 +24,7 @@ from typing import Optional
 
 from pydantic import BaseModel
 
+from verl.utils.executor_guard import guard_stop_iteration
 from verl.utils.ray_utils import get_event_loop
 
 _trace_enabled: ContextVar[bool] = ContextVar("_trace_enabled", default=True)
@@ -443,12 +444,18 @@ def rollout_trace_op(func):
                 return result
             loop = get_event_loop()
             if hasattr(result, "prompt_ids"):
-                _result["prompt_text"] = await loop.run_in_executor(None, tokenizer.decode, result.prompt_ids)
+                _result["prompt_text"] = await loop.run_in_executor(
+                    None, guard_stop_iteration(lambda: tokenizer.decode(result.prompt_ids))
+                )
             if hasattr(result, "response_ids"):
-                _result["response_text"] = await loop.run_in_executor(None, tokenizer.decode, result.response_ids)
+                _result["response_text"] = await loop.run_in_executor(
+                    None, guard_stop_iteration(lambda: tokenizer.decode(result.response_ids))
+                )
             # TokenOutput (generate): token_ids holds the response tokens.
             if hasattr(result, "token_ids") and not hasattr(result, "prompt_ids"):
-                _result["response_text"] = await loop.run_in_executor(None, tokenizer.decode, result.token_ids)
+                _result["response_text"] = await loop.run_in_executor(
+                    None, guard_stop_iteration(lambda: tokenizer.decode(result.token_ids))
+                )
             return _result
 
         async def add_token2text_to_inputs(self, inputs_dict):
@@ -459,7 +466,9 @@ def rollout_trace_op(func):
             prompt_ids = inputs_dict.get("prompt_ids")
             if isinstance(prompt_ids, list | tuple) and len(prompt_ids) > 0:
                 loop = get_event_loop()
-                prompt_text = await loop.run_in_executor(None, tokenizer.decode, prompt_ids)
+                prompt_text = await loop.run_in_executor(
+                    None, guard_stop_iteration(lambda: tokenizer.decode(prompt_ids))
+                )
                 inputs_dict = {**inputs_dict, "prompt_text": prompt_text}
             return inputs_dict
 

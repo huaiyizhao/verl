@@ -46,6 +46,7 @@ from verl.experimental.agent_loop import (
     AgentLoopWorker,
 )
 from verl.trainer.ppo.v1.agent_loop_tq import apply_greedy_sampling_params
+from verl.utils.executor_guard import guard_stop_iteration
 from verl.utils.ray_utils import auto_await
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 from verl.utils.tokenizer import get_processor_token_id
@@ -287,7 +288,9 @@ class RolloutAgentLoopWorkerTQ(AgentLoopWorker):
         # Build the rows off the event loop (heavy synchronous image / position-id processing)
         # so concurrent rollouts on this worker are not blocked; the TQ put stays async.
         loop = asyncio.get_running_loop()
-        keys, fields, tags, timing = await loop.run_in_executor(self._postproc_pool, self._build_rows, outputs, kwargs)
+        keys, fields, tags, timing = await loop.run_in_executor(
+            self._postproc_pool, guard_stop_iteration(lambda: self._build_rows(outputs, kwargs))
+        )
 
         _t = time.perf_counter()
         await tq.async_kv_batch_put(

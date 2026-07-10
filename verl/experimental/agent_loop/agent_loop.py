@@ -51,6 +51,7 @@ from verl.tools.tool_registry import load_all_tools
 from verl.trainer.distillation import is_distillation_enabled
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
+from verl.utils.executor_guard import guard_stop_iteration
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.profiler import simple_timer
 from verl.utils.ray_utils import auto_await, get_event_loop
@@ -353,7 +354,7 @@ class AgentLoopBase(ABC):
         """Build the initial prompt token ids with Continuous Token."""
         prompt_ids = await self.loop.run_in_executor(
             None,
-            lambda: self.continuous_token_builder.build_initial_tokens(messages, tools=tools),
+            guard_stop_iteration(lambda: self.continuous_token_builder.build_initial_tokens(messages, tools=tools)),
         )
         return self._cap_text_prompt_length(prompt_ids)
 
@@ -369,11 +370,13 @@ class AgentLoopBase(ABC):
         """Merge appended non-assistant messages into runtime tokens and metadata."""
         merge_result = await self.loop.run_in_executor(
             None,
-            lambda: self.continuous_token_builder.merge_non_assistant_tokens(
-                previous_messages,
-                updated_messages,
-                runtime_token_ids,
-                tools=tools,
+            guard_stop_iteration(
+                lambda: self.continuous_token_builder.merge_non_assistant_tokens(
+                    previous_messages,
+                    updated_messages,
+                    runtime_token_ids,
+                    tools=tools,
+                )
             ),
         )
         aligned_response_mask, aligned_response_logprobs = self.continuous_token_builder.align_response_metadata(
@@ -392,9 +395,11 @@ class AgentLoopBase(ABC):
         """Merge assistant-generated tokens and align response metadata."""
         merge_result = await self.loop.run_in_executor(
             None,
-            lambda: self.continuous_token_builder.merge_assistant_tokens(
-                runtime_token_ids,
-                assistant_token_ids,
+            guard_stop_iteration(
+                lambda: self.continuous_token_builder.merge_assistant_tokens(
+                    runtime_token_ids,
+                    assistant_token_ids,
+                )
             ),
         )
         aligned_response_mask, aligned_response_logprobs = self.continuous_token_builder.align_response_metadata(
@@ -441,13 +446,15 @@ class AgentLoopBase(ABC):
         if self.processor is not None:
             raw_prompt = await self.loop.run_in_executor(
                 None,
-                lambda: apply_chat_template(
-                    self.processor,
-                    messages,
-                    tools=tools,
-                    add_generation_prompt=True,
-                    tokenize=False,
-                    **self.apply_chat_template_kwargs,
+                guard_stop_iteration(
+                    lambda: apply_chat_template(
+                        self.processor,
+                        messages,
+                        tools=tools,
+                        add_generation_prompt=True,
+                        tokenize=False,
+                        **self.apply_chat_template_kwargs,
+                    )
                 ),
             )
 
@@ -465,13 +472,15 @@ class AgentLoopBase(ABC):
         else:
             tokenized_prompt = await self.loop.run_in_executor(
                 None,
-                lambda: apply_chat_template(
-                    self.tokenizer,
-                    messages,
-                    tools=tools,
-                    add_generation_prompt=True,
-                    tokenize=True,
-                    **self.apply_chat_template_kwargs,
+                guard_stop_iteration(
+                    lambda: apply_chat_template(
+                        self.tokenizer,
+                        messages,
+                        tools=tools,
+                        add_generation_prompt=True,
+                        tokenize=True,
+                        **self.apply_chat_template_kwargs,
+                    )
                 ),
             )
             prompt_ids = normalize_token_ids(tokenized_prompt)

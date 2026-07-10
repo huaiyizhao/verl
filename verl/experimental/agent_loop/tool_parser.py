@@ -22,6 +22,7 @@ import regex
 from pydantic import BaseModel
 
 from verl.tools.schemas import OpenAIFunctionToolSchema
+from verl.utils.executor_guard import guard_stop_iteration
 from verl.utils.ray_utils import get_event_loop
 from verl.utils.rollout_trace import rollout_trace_op
 
@@ -109,7 +110,7 @@ class HermesToolParser(ToolParser):
         self, responses_ids: list[int], tools: list[OpenAIFunctionToolSchema] = None
     ) -> tuple[str, list[FunctionCall]]:
         loop = get_event_loop()
-        text = await loop.run_in_executor(None, self.tokenizer.decode, responses_ids)
+        text = await loop.run_in_executor(None, guard_stop_iteration(lambda: self.tokenizer.decode(responses_ids)))
         if self.tool_call_start_token not in text or self.tool_call_end_token not in text:
             return text, []
 
@@ -159,7 +160,9 @@ class GptOssToolParser(ToolParser):
     ) -> tuple[str, list[FunctionCall]]:
         loop = get_event_loop()
         # We need to keep special tokens for gpt-oss model for better tool call extraction.
-        text = await loop.run_in_executor(None, lambda: self.tokenizer.decode(responses_ids, skip_special_tokens=False))
+        text = await loop.run_in_executor(
+            None, guard_stop_iteration(lambda: self.tokenizer.decode(responses_ids, skip_special_tokens=False))
+        )
         # Need to remove padding tokens for better tool call extraction.
         text = text.replace(self.tokenizer.pad_token, "")
         # Need to reomve COT since COT may contain tool call tokens.But they are not valid tool calls.
@@ -336,7 +339,7 @@ class Qwen3XMLToolParser(ToolParser):
         self, responses_ids: list[int], tools: list[OpenAIFunctionToolSchema] = None
     ) -> tuple[str, list[FunctionCall]]:
         loop = get_event_loop()
-        text = await loop.run_in_executor(None, self.tokenizer.decode, responses_ids)
+        text = await loop.run_in_executor(None, guard_stop_iteration(lambda: self.tokenizer.decode(responses_ids)))
         if self.tool_call_start_token not in text:
             return text, []
 
@@ -417,7 +420,7 @@ class GLMToolParser(ToolParser):
         loop = get_event_loop()
         text = await loop.run_in_executor(
             None,
-            lambda: self.tokenizer.decode(responses_ids, skip_special_tokens=False),
+            guard_stop_iteration(lambda: self.tokenizer.decode(responses_ids, skip_special_tokens=False)),
         )
         if self.tool_call_start_token not in text or self.tool_call_end_token not in text:
             return text, []
@@ -475,7 +478,7 @@ class SeedToolParser(ToolParser):
         loop = get_event_loop()
         text = await loop.run_in_executor(
             None,
-            lambda: self.tokenizer.decode(responses_ids, skip_special_tokens=False),
+            guard_stop_iteration(lambda: self.tokenizer.decode(responses_ids, skip_special_tokens=False)),
         )
         if self.tool_call_start_token not in text or self.tool_call_end_token not in text:
             return text, []
@@ -530,7 +533,7 @@ class MiniMaxToolParser(ToolParser):
         loop = get_event_loop()
         text = await loop.run_in_executor(
             None,
-            lambda: self.tokenizer.decode(responses_ids, skip_special_tokens=False),
+            guard_stop_iteration(lambda: self.tokenizer.decode(responses_ids, skip_special_tokens=False)),
         )
         if self.tool_call_start_token not in text or self.tool_call_end_token not in text:
             return text, []
@@ -615,7 +618,7 @@ class KimiToolParser(ToolParser):
         loop = get_event_loop()
         text = await loop.run_in_executor(
             None,
-            lambda: self.tokenizer.decode(responses_ids, skip_special_tokens=False),
+            guard_stop_iteration(lambda: self.tokenizer.decode(responses_ids, skip_special_tokens=False)),
         )
         if self.tool_calls_section_start_token not in text:
             return text, []
@@ -687,7 +690,9 @@ class Gemma4ToolParser(ToolParser):
         self, responses_ids: list[int], tools: list[OpenAIFunctionToolSchema] = None
     ) -> tuple[str, list[FunctionCall]]:
         loop = get_event_loop()
-        text = await loop.run_in_executor(None, lambda: self.tokenizer.decode(responses_ids, skip_special_tokens=False))
+        text = await loop.run_in_executor(
+            None, guard_stop_iteration(lambda: self.tokenizer.decode(responses_ids, skip_special_tokens=False))
+        )
         if self.tokenizer.pad_token:
             text = text.replace(self.tokenizer.pad_token, "")
 
