@@ -93,6 +93,119 @@ _MM_ROWCHECK_OK_LOGGED = [0]  # cap the "all consistent" confirmations so they n
 # split is accurate under async CUDA; gated by the master VERL_PROFILE or the narrower
 # VERL_STEP_PROFILE (same knob as the trainer's [STEP_PROFILE]). Zero overhead when off.
 _FBP_PROFILE = _MM_ROWCHECK or os.getenv("VERL_STEP_PROFILE", "0") not in ("0", "false", "False", "")
+_FSDP_MEM_DEBUG = os.getenv("VERL_FSDP_MEM_DEBUG", "0") not in ("0", "false", "False", "")
+_FSDP_MEM_DEBUG_MAX_MICRO = int(os.getenv("VERL_FSDP_MEM_DEBUG_MAX_MICRO", "4"))
+
+
+def _fsdp_mem_debug_enabled_on_rank() -> bool:
+    if not _FSDP_MEM_DEBUG:
+        return False
+    if not torch.distributed.is_initialized():
+        return True
+
+    rank = torch.distributed.get_rank()
+    spec = os.getenv("VERL_FSDP_MEM_DEBUG_RANKS", "0").strip().lower()
+    if spec in ("*", "all"):
+        return True
+    try:
+        return rank in {int(x) for x in spec.split(",") if x.strip()}
+    except ValueError:
+        return rank == 0
+
+
+def _fsdp_mem_stats() -> str:
+    try:
+        device = get_torch_device()
+        alloc = device.memory_allocated() / 1024**3
+        reserved = device.memory_reserved() / 1024**3
+        peak = device.max_memory_allocated() / 1024**3
+        return f"mem_alloc={alloc:.2f}GiB mem_reserved={reserved:.2f}GiB mem_peak={peak:.2f}GiB"
+    except Exception as exc:  # noqa: BLE001
+        return f"mem=n/a({exc!r})"
+
+
+def _tensor_debug_desc(name: str, value) -> str | None:
+    if not torch.is_tensor(value):
+        return None
+    if value.is_nested:
+        values = value.values()
+        return f"{name}=nested values={tuple(values.shape)} dtype={values.dtype} requires_grad={values.requires_grad}"
+    return f"{name}=shape={tuple(value.shape)} dtype={value.dtype} requires_grad={value.requires_grad}"
+
+
+def _output_debug_desc(output) -> str:
+    parts = []
+    for name in ("logits", "log_probs", "entropy", "hidden_states"):
+        value = getattr(output, name, None)
+        desc = _tensor_debug_desc(name, value)
+        if desc is not None:
+            parts.append(desc)
+    return " ".join(parts) if parts else f"output_type={type(output).__name__}"
+
+
+def _model_output_debug_desc(model_output: dict) -> str:
+    parts = []
+    for name in ("log_probs", "entropy", "sum_pi_squared"):
+        desc = _tensor_debug_desc(name, model_output.get(name))
+        if desc is not None:
+            parts.append(desc)
+    return " ".join(parts) if parts else "model_output=no_tensor_desc"
+
+
+def _micro_batch_debug_desc(micro_batch: TensorDict) -> str:
+    input_ids = micro_batch.get("input_ids")
+    if input_ids is None:
+        return "input_ids=absent"
+
+    if input_ids.is_nested:
+        seq_lens = input_ids.offsets().diff()
+        bsz = int(seq_lens.numel())
+        total = int(seq_lens.sum().item())
+        max_seq = int(seq_lens.max().item()) if bsz else 0
+        min_seq = int(seq_lens.min().item()) if bsz else 0
+        dense_tokens = bsz * max_seq
+        seq_preview = seq_lens[: min(8, bsz)].detach().cpu().tolist()
+    else:
+        bsz = int(input_ids.shape[0])
+        if "attention_mask" in micro_batch.keys():
+            seq_lens = micro_batch["attention_mask"].sum(dim=1)
+            total = int(seq_lens.sum().item())
+            max_seq = int(seq_lens.max().item()) if bsz else 0
+            min_seq = int(seq_lens.min().item()) if bsz else 0
+            seq_preview = seq_lens[: min(8, bsz)].detach().cpu().tolist()
+        else:
+            max_seq = int(input_ids.shape[-1])
+            min_seq = max_seq
+            total = int(input_ids.numel())
+            seq_preview = [max_seq] * min(8, bsz)
+        dense_tokens = int(input_ids.numel())
+
+    response_mask = micro_batch.get("response_mask")
+    if response_mask is None:
+        resp = "resp_tokens=n/a"
+    elif response_mask.is_nested:
+        resp = f"resp_tokens={int(response_mask.values().sum().item())}"
+    else:
+        resp = f"resp_tokens={int(response_mask.sum().item())}"
+
+    use_remove_padding = tu.get_non_tensor_data(micro_batch, "use_remove_padding", default=None)
+    use_fused_kernels = tu.get_non_tensor_data(micro_batch, "use_fused_kernels", default=None)
+    calculate_entropy = tu.get_non_tensor_data(micro_batch, "calculate_entropy", default=None)
+    max_token_len = tu.get_non_tensor_data(micro_batch, "max_token_len_per_gpu", default=None)
+    return (
+        f"bsz={bsz} total_tokens={total} min_seq={min_seq} max_seq={max_seq} "
+        f"dense_tokens={dense_tokens} seq_lens_head={seq_preview} {resp} "
+        f"max_token_len_per_gpu={max_token_len} use_remove_padding={use_remove_padding} "
+        f"use_fused_kernels={use_fused_kernels} calculate_entropy={calculate_entropy}"
+    )
+
+
+def _fsdp_mem_debug_print(tag: str, details: str = "") -> None:
+    if not _fsdp_mem_debug_enabled_on_rank():
+        return
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    suffix = f" {details}" if details else ""
+    print(f"[FSDP_MEM] rank={rank} {tag}{suffix} {_fsdp_mem_stats()}", flush=True)
 
 
 def _mm_fingerprint(mm) -> str | None:
@@ -1188,23 +1301,58 @@ class FSDPEngine(BaseEngine):
         _dev = get_torch_device() if _prof else None
         t_fwd = t_bwd = 0.0
 
-        for micro_batch in micro_batches:
+        if _fsdp_mem_debug_enabled_on_rank():
+            micro_token_sums = []
+            micro_max_seqs = []
+            for micro_batch in micro_batches:
+                input_ids = micro_batch.get("input_ids")
+                if input_ids is not None and input_ids.is_nested:
+                    seq_lens = input_ids.offsets().diff()
+                    micro_token_sums.append(int(seq_lens.sum().item()))
+                    micro_max_seqs.append(int(seq_lens.max().item()))
+                elif input_ids is not None:
+                    micro_token_sums.append(int(input_ids.numel()))
+                    micro_max_seqs.append(int(input_ids.shape[-1]))
+            _fsdp_mem_debug_print(
+                "after_micro_split",
+                (
+                    f"mode={'fwd_only' if forward_only else 'train'} n_micro={len(micro_batches)} "
+                    f"micro_tokens={micro_token_sums} micro_max_seq={micro_max_seqs} "
+                    f"full_batch=({_micro_batch_debug_desc(data)})"
+                ),
+            )
+
+        for micro_idx, micro_batch in enumerate(micro_batches):
+            debug_this = _fsdp_mem_debug_enabled_on_rank() and micro_idx < _FSDP_MEM_DEBUG_MAX_MICRO
+            if debug_this:
+                tu.assign_non_tensor(micro_batch, _fsdp_mem_debug_micro_idx=micro_idx)
+                _fsdp_mem_debug_print(
+                    f"micro{micro_idx}:before_forward",
+                    _micro_batch_debug_desc(micro_batch),
+                )
             with ctx:
                 if _prof:
                     _dev.synchronize()
                     _t = time.perf_counter()
                 loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
+                if debug_this:
+                    loss_val = float(loss.detach().float().item()) if torch.is_tensor(loss) else float(loss)
+                    _fsdp_mem_debug_print(f"micro{micro_idx}:after_forward_loss", f"loss={loss_val:.6g}")
                 if _prof:
                     _dev.synchronize()
                     t_fwd += time.perf_counter() - _t
 
                 if not forward_only:
+                    if debug_this:
+                        _fsdp_mem_debug_print(f"micro{micro_idx}:before_backward")
                     if _prof:
                         _t = time.perf_counter()
                     if scaler is not None:
                         scaler.scale(loss).backward()
                     else:
                         loss.backward()
+                    if debug_this:
+                        _fsdp_mem_debug_print(f"micro{micro_idx}:after_backward")
                     if _prof:
                         _dev.synchronize()
                         t_bwd += time.perf_counter() - _t
@@ -1900,6 +2048,18 @@ class FSDPEngineWithLMHead(FSDPEngine):
         # actually, we should avoid assigning like this...
         micro_batch = micro_batch.to(get_device_id())
         model_inputs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
+        debug_micro_idx = tu.get_non_tensor_data(micro_batch, "_fsdp_mem_debug_micro_idx", default=None)
+        debug_this = debug_micro_idx is not None and _fsdp_mem_debug_enabled_on_rank()
+        if debug_this:
+            input_parts = []
+            for key in ("input_ids", "position_ids", "attention_mask", "pixel_values", "image_grid_thw"):
+                desc = _tensor_debug_desc(key, model_inputs.get(key))
+                if desc is not None:
+                    input_parts.append(desc)
+            _fsdp_mem_debug_print(
+                f"micro{debug_micro_idx}:model_inputs",
+                " ".join(input_parts) if input_parts else "model_inputs=no_tensor_desc",
+            )
 
         # Honor mixed_precision.param_dtype resolved during FSDP setup. When dtype is fp32,
         # autocast is a no-op at best and a footgun at worst, so skip it entirely.
@@ -1916,15 +2076,32 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 **model_inputs,
                 use_cache=False,
             )  # prevent model thinks we are generating
+            if debug_this:
+                _fsdp_mem_debug_print(
+                    f"micro{debug_micro_idx}:after_model_forward",
+                    f"autocast_dtype={autocast_dtype} {_output_debug_desc(raw_output)}",
+                )
 
             model_output = self.prepare_model_outputs(
                 output=raw_output, output_args=output_args, micro_batch=micro_batch, logits_processor_func=loss_function
             )
+            if debug_this:
+                _fsdp_mem_debug_print(
+                    f"micro{debug_micro_idx}:after_prepare_outputs",
+                    _model_output_debug_desc(model_output),
+                )
 
             if loss_function is not None:
                 loss, metrics = loss_function(
                     model_output=model_output, data=micro_batch, dp_group=self.get_data_parallel_group()
                 )
+                if debug_this:
+                    metric_keys = sorted(metrics.keys())[:8] if isinstance(metrics, dict) else []
+                    loss_val = float(loss.detach().float().item()) if torch.is_tensor(loss) else float(loss)
+                    _fsdp_mem_debug_print(
+                        f"micro{debug_micro_idx}:after_loss",
+                        f"loss={loss_val:.6g} metric_keys={metric_keys}",
+                    )
                 # AFTER the loss: the loss has stashed this batch's max seq-mean-k3, so the probe can
                 # gate on it and dump only a MASKED batch (see _maybe_dump_logprob_probe).
                 _maybe_dump_logprob_probe(micro_batch, model_output, module=self.module)
