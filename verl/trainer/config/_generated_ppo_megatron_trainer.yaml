@@ -344,6 +344,7 @@ actor_rollout_ref:
       num_workers: 8
       default_agent_loop: single_turn_agent
       agent_loop_config_path: null
+      use_chat_template_tools: false
       custom_async_server:
         _target_: verl.workers.config.CustomAsyncServerConfig
         path: null

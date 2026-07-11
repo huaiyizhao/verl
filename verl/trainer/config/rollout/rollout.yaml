@@ -256,6 +256,9 @@ agent:
   #   max_terms: 6
   agent_loop_config_path: null
 
+  # Render tool definitions through the model chat template via the tools= argument.
+  use_chat_template_tools: false
+
   # custom async server configs
   custom_async_server:
 
