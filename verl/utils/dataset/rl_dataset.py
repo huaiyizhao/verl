@@ -34,6 +34,7 @@ from transformers import PreTrainedTokenizer, ProcessorMixin
 
 from verl.utils.import_utils import load_extern_object
 from verl.utils.tokenizer import build_multimodal_processor_inputs, normalize_token_ids
+from verl.utils.tokenizer.chat_template import apply_chat_template
 
 logger = logging.getLogger(__name__)
 
@@ -211,8 +212,12 @@ class RLHFDataset(Dataset):
                         if self.tool_schemas is not None:
                             apply_kwargs["tools"] = self.tool_schemas
 
-                        raw_prompt = self.processor.apply_chat_template(
-                            messages, add_generation_prompt=True, tokenize=False, **apply_kwargs
+                        raw_prompt = apply_chat_template(
+                            self.processor,
+                            messages,
+                            add_generation_prompt=True,
+                            tokenize=False,
+                            **apply_kwargs,
                         )
                         images, videos, audios = self._process_multi_modal_info(
                             messages, self.image_patch_size, self.config
@@ -256,8 +261,12 @@ class RLHFDataset(Dataset):
                         apply_kwargs.pop("return_dict", None)
                         apply_kwargs.pop("return_tensors", None)
 
-                        tokenized_prompt = tokenizer.apply_chat_template(
-                            doc[prompt_key], add_generation_prompt=True, tokenize=True, **apply_kwargs
+                        tokenized_prompt = apply_chat_template(
+                            tokenizer,
+                            doc[prompt_key],
+                            add_generation_prompt=True,
+                            tokenize=True,
+                            **apply_kwargs,
                         )
                         return len(normalize_token_ids(tokenized_prompt))
                     except Exception:
