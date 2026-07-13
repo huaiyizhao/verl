@@ -17,7 +17,7 @@ from pprint import pprint
 
 import hydra
 import ray
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
@@ -61,7 +61,11 @@ def run_ppo(config, task_runner_class) -> None:
         if config.transfer_queue.enable:
             # Add runtime environment variables for transfer queue
             runtime_env_vars = runtime_env_kwargs.get("env_vars", {})
-            runtime_env_vars["TRANSFER_QUEUE_ENABLE"] = "1"
+            if isinstance(runtime_env_vars, DictConfig):
+                with open_dict(runtime_env_vars):
+                    runtime_env_vars["TRANSFER_QUEUE_ENABLE"] = "1"
+            else:
+                runtime_env_vars["TRANSFER_QUEUE_ENABLE"] = "1"
             runtime_env_kwargs["env_vars"] = runtime_env_vars
 
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
