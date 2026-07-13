@@ -13,6 +13,7 @@
 # limitations under the License.
 import argparse
 import asyncio
+import glob
 import inspect
 import json
 import logging
@@ -81,6 +82,63 @@ else:
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
+
+
+def _find_real_cudart_so() -> str | None:
+    env_path = os.environ.get("VLLM_CUDART_SO_PATH")
+    candidates = [env_path] if env_path else []
+    for pattern in (
+        "/usr/local/cuda*/targets/x86_64-linux/lib/libcudart.so*",
+        "/usr/local/cuda*/lib64/libcudart.so*",
+        "/usr/local/lib/python*/dist-packages/nvidia/cuda_runtime/lib/libcudart.so*",
+        "/usr/local/lib/python*/site-packages/nvidia/cuda_runtime/lib/libcudart.so*",
+        "/usr/lib/x86_64-linux-gnu/libcudart.so*",
+    ):
+        candidates.extend(glob.glob(pattern))
+
+    for path in candidates:
+        if not path or not os.path.exists(path):
+            continue
+        lowered = path.lower()
+        basename = os.path.basename(lowered)
+        if "tilelang" in lowered or "stub" in basename:
+            continue
+        return path
+    return None
+
+
+def _patch_vllm_cudart_lookup() -> None:
+    try:
+        from vllm.distributed.device_communicators import cuda_wrapper
+    except Exception as exc:
+        logger.warning("Failed to patch vLLM CUDA runtime lookup: %s", exc)
+        return
+
+    if getattr(cuda_wrapper, "_verl_tilelang_cudart_patch", False):
+        return
+
+    real_cudart = _find_real_cudart_so()
+    if real_cudart:
+        os.environ.setdefault("VLLM_CUDART_SO_PATH", real_cudart)
+
+    original_find_loaded_library = cuda_wrapper.find_loaded_library
+
+    def find_loaded_library(lib_name: str) -> str | None:
+        path = original_find_loaded_library(lib_name)
+        if (
+            lib_name == "libcudart"
+            and path
+            and "tilelang" in path.lower()
+            and "libcudart_stub" in os.path.basename(path).lower()
+        ):
+            replacement = _find_real_cudart_so()
+            if replacement:
+                logger.warning("Ignoring tilelang CUDA runtime stub %s; using %s", path, replacement)
+                return replacement
+        return path
+
+    cuda_wrapper.find_loaded_library = find_loaded_library
+    cuda_wrapper._verl_tilelang_cudart_patch = True
 
 
 class vLLMHttpServer:
@@ -391,12 +449,14 @@ class vLLMHttpServer:
             cmds[server_args.subparser].validate(server_args)
 
         # 3. launch server
+        _patch_vllm_cudart_lookup()
         if self.node_rank == 0:
             await self.run_server(server_args)
         else:
             await self.run_headless(server_args)
 
     async def run_server(self, args: argparse.Namespace):
+        _patch_vllm_cudart_lookup()
         engine_args = AsyncEngineArgs.from_cli_args(args)
         usage_context = UsageContext.OPENAI_API_SERVER
         vllm_config = engine_args.create_engine_config(usage_context=usage_context)
