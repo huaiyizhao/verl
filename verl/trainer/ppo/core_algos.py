@@ -2656,7 +2656,7 @@ def compute_policy_loss_bypass_mode(
         - For REINFORCE: We use IS weights w = π_current / π_rollout explicitly
         - For PPO-clip: The PPO ratio π_current / π_old = π_current / π_rollout
           already incorporates the IS correction through clipping, so we do NOT
-          apply additional IS weights (would be double-counting)
+          apply additional IS weights (would be double-counting)xz
 
     Loss types:
         - "ppo_clip" (default): PPO clipped objective (compute_policy_loss_vanilla)

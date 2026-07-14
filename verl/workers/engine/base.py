@@ -27,6 +27,18 @@ from verl.utils.device import get_device_name, get_vendor
 from verl.utils.tensordict_utils import maybe_fix_3d_position_ids
 
 
+def _train_mem_debug_enabled() -> bool:
+    return os.getenv("VERL_TRAIN_MEM_DEBUG", "0").lower() in {"1", "true", "yes", "on"}
+
+
+def _log_train_gpu_memory(label: str) -> None:
+    if not _train_mem_debug_enabled():
+        return
+    from verl.utils.profiler import log_gpu_memory_usage
+
+    log_gpu_memory_usage(f"[TRAIN_MEM] {label}", logger=None, rank=None)
+
+
 class BaseEngine:
     """
     Abstract base class defining the interface for model training engines. Interface is subject to
@@ -123,9 +135,14 @@ class BaseEngine:
         """
         maybe_fix_3d_position_ids(data)
 
+        engine_name = type(self).__name__
+        _log_train_gpu_memory(f"{engine_name}:before_zero_grad")
         self.optimizer_zero_grad()
+        _log_train_gpu_memory(f"{engine_name}:after_zero_grad_before_forward_backward")
         outputs = self.forward_backward_batch(data, loss_function, forward_only=False)
+        _log_train_gpu_memory(f"{engine_name}:after_forward_backward_before_optimizer_step")
         grad_norm = self.optimizer_step()
+        _log_train_gpu_memory(f"{engine_name}:after_optimizer_step")
         if self.is_mp_src_rank_with_outputs():
             assert "grad_norm" not in outputs["metrics"]
             outputs["metrics"]["grad_norm"] = grad_norm

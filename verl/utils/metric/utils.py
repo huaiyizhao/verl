@@ -140,13 +140,26 @@ class Metric:
         if not metric_lists:
             raise ValueError("Cannot aggregate an empty list of metrics.")
         value_lists = [ml.values for ml in metric_lists]
-        if not all(len(ls) == len(value_lists[0]) for ls in value_lists):
-            raise ValueError(
-                f"All Metric instances must have the same number of values "
-                f"for dp aggregation: {[len(ls) for ls in value_lists]}"
-            )
-        value_arrays = np.array(value_lists)  # [num_dp, num_grad_accumulation]
         aggregation = metric_lists[0].aggregation
+        if not all(len(ls) == len(value_lists[0]) for ls in value_lists):
+            # Variable-length/multi-turn batches can expand to a row count that is
+            # not exactly divisible by DP size. In that case DP ranks can run a
+            # slightly different number of micro-batches, so there is no stable
+            # per-micro-batch alignment to average over. Aggregate each rank first
+            # and then average across DP ranks, preserving the old SUM semantics
+            # of "mean over DP, then aggregate over micro-batches".
+            rank_values = [cls._aggregate(values=ls, aggregation=aggregation) for ls in value_lists if len(ls) > 0]
+            if not rank_values:
+                raise ValueError("Cannot aggregate metrics with no values on any DP rank.")
+            match aggregation:
+                case AggregationType.SUM | AggregationType.MEAN:
+                    return np.mean(rank_values)
+                case AggregationType.MIN:
+                    return np.min(rank_values)
+                case AggregationType.MAX:
+                    return np.max(rank_values)
+
+        value_arrays = np.array(value_lists)  # [num_dp, num_grad_accumulation]
         match aggregation:
             case AggregationType.SUM | AggregationType.MEAN:
                 return cls._aggregate(

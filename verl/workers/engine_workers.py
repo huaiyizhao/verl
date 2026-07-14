@@ -73,6 +73,104 @@ def _with_routing_replay_flag(enabled: bool):
     return decorator
 
 
+def _train_mem_debug_enabled() -> bool:
+    return os.getenv("VERL_TRAIN_MEM_DEBUG", "0").lower() in {"1", "true", "yes", "on"}
+
+
+def _tensor_logical_nbytes(tensor: torch.Tensor) -> int:
+    try:
+        return int(tensor.numel()) * int(tensor.element_size())
+    except Exception:
+        total = 0
+        for attr in ("values", "offsets"):
+            fn = getattr(tensor, attr, None)
+            if callable(fn):
+                try:
+                    value = fn()
+                except Exception:
+                    continue
+                if isinstance(value, torch.Tensor) and value is not tensor:
+                    total += _tensor_logical_nbytes(value)
+        return total
+
+
+def _tensor_storage_id_and_nbytes(tensor: torch.Tensor) -> tuple[tuple[str, int] | None, int]:
+    try:
+        storage = tensor.untyped_storage()
+        return (str(tensor.device), int(storage.data_ptr())), int(storage.nbytes())
+    except Exception:
+        return None, _tensor_logical_nbytes(tensor)
+
+
+def _summarize_tensor_data(obj: object) -> tuple[int, int, int, int, list[tuple[int, str, str, str]]]:
+    logical_total = 0
+    logical_cuda = 0
+    storage_total = 0
+    storage_cuda = 0
+    seen_storage: set[tuple[str, int]] = set()
+    tensors: list[tuple[int, str, str, str]] = []
+
+    def visit(path: str, value: object) -> None:
+        nonlocal logical_total, logical_cuda, storage_total, storage_cuda
+        if isinstance(value, torch.Tensor):
+            logical = _tensor_logical_nbytes(value)
+            logical_total += logical
+            if value.device.type == get_device_name():
+                logical_cuda += logical
+            storage_id, storage_nbytes = _tensor_storage_id_and_nbytes(value)
+            if storage_id is None or storage_id not in seen_storage:
+                if storage_id is not None:
+                    seen_storage.add(storage_id)
+                storage_total += storage_nbytes
+                if value.device.type == get_device_name():
+                    storage_cuda += storage_nbytes
+            shape = tuple(value.shape) if not getattr(value, "is_nested", False) else "nested"
+            tensors.append((logical, path, f"{shape}", f"{value.dtype}@{value.device}"))
+            return
+
+        if isinstance(value, TensorDict):
+            for key in value.keys():
+                try:
+                    visit(f"{path}.{key}" if path else str(key), value.get(key))
+                except Exception:
+                    continue
+            return
+
+        if isinstance(value, dict):
+            for key, child in value.items():
+                visit(f"{path}.{key}" if path else str(key), child)
+            return
+
+        if isinstance(value, list | tuple):
+            for idx, child in enumerate(value):
+                visit(f"{path}[{idx}]", child)
+
+    visit("", obj)
+    tensors.sort(reverse=True, key=lambda item: item[0])
+    return logical_total, logical_cuda, storage_total, storage_cuda, tensors[:8]
+
+
+def _log_train_batch_data_memory(data: TensorDict, label: str) -> None:
+    if not _train_mem_debug_enabled():
+        return
+    logical_total, logical_cuda, storage_total, storage_cuda, top_tensors = _summarize_tensor_data(data)
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+    local_rank = os.getenv("LOCAL_RANK", "?")
+    top = "; ".join(
+        f"{name}:{nbytes / 1024**3:.3f}GB:{shape}:{dtype_device}" for nbytes, name, shape, dtype_device in top_tensors
+    )
+    print(
+        "[TRAIN_MEM] "
+        f"{label} rank={rank} local_rank={local_rank} pid={os.getpid()} "
+        f"tensor_logical_total_gb={logical_total / 1024**3:.3f} "
+        f"tensor_logical_cuda_gb={logical_cuda / 1024**3:.3f} "
+        f"unique_storage_total_gb={storage_total / 1024**3:.3f} "
+        f"unique_storage_cuda_gb={storage_cuda / 1024**3:.3f} "
+        f"top={top}",
+        flush=True,
+    )
+
+
 class TrainingWorker(Worker, DistProfilerExtension):
     """
     TrainingWorker provides a Tinker-like API (https://thinkingmachines.ai/tinker/) as a RayWorkerGroup
@@ -347,11 +445,27 @@ class TrainingWorker(Worker, DistProfilerExtension):
             if key not in data.keys():
                 tu.assign_non_tensor(data, **{key: val})
 
+        _log_train_batch_data_memory(data, "TrainingWorker.train_batch.input")
+        if _train_mem_debug_enabled():
+            log_gpu_memory_usage("[TRAIN_MEM] TrainingWorker.train_batch.before_train_mode", logger=None, rank=None)
+
         with (
             self.engine.train_mode(disable_auto_offload=disable_auto_offload),
             Timer(name="train_batch", logger=None) as timer,
         ):
+            if _train_mem_debug_enabled():
+                log_gpu_memory_usage(
+                    "[TRAIN_MEM] TrainingWorker.train_batch.entered_train_mode_before_engine_train_batch",
+                    logger=None,
+                    rank=None,
+                )
             output = self.engine.train_batch(data, loss_function=self.loss_fn)
+            if _train_mem_debug_enabled():
+                log_gpu_memory_usage(
+                    "[TRAIN_MEM] TrainingWorker.train_batch.after_engine_train_batch",
+                    logger=None,
+                    rank=None,
+                )
             # containing loss, model_output and metrics
             # for training, we only care about loss and metrics
         delta_time = timer.last
