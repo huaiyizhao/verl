@@ -361,8 +361,17 @@ async def resolve_image_ids(
             " ".join(raw_sample),
         )
 
-    cache = cache if cache is not None else ImageLRU()
-    needed = sorted({k for ids in image_ids_per_row for k in ids if k not in cache})
+    referenced = sorted({k for ids in image_ids_per_row for k in ids})
+    # Snapshot all payloads needed by this materialization into a plain dict.
+    # cache=None means no ImageLRU at all: fetch the current batch directly into
+    # this dict and drop it after reconstruction.
+    fetched: dict[str, dict[str, Any]] = {}
+    if cache is not None:
+        for key in referenced:
+            payload = cache.get(key)
+            if payload is not None:
+                fetched[key] = payload
+    needed = [k for k in referenced if k not in fetched]
     _t = time.perf_counter()
     if needed:
         # Each key is a single image; a multi-key get is jagged (heterogeneous
@@ -378,7 +387,9 @@ async def resolve_image_ids(
             for i, key in enumerate(needed):
                 new_payloads[key][fname] = cols[i]
         for key, payload in new_payloads.items():
-            cache.put(key, payload)
+            fetched[key] = payload
+            if cache is not None:
+                cache.put(key, payload)
 
         if _PROFILE and _RESOLVE_DBG[0] <= 12:
             # Verify the user's hypothesis: do DISTINCT image keys come back as the SAME image
@@ -403,13 +414,31 @@ async def resolve_image_ids(
             )
     t_fetch = time.perf_counter() - _t
 
-    # Snapshot the payloads this batch needs so concurrent LRU eviction cannot
-    # disturb the in-flight reconstruct.
-    fetched: dict[str, dict[str, Any]] = {}
-    for ids in image_ids_per_row:
-        for key in ids:
-            if key not in fetched:
-                fetched[key] = cache.get(key)
+    invalid_payload_keys = {
+        key
+        for key in referenced
+        if fetched.get(key) is None
+        or fetched[key].get("pixel_values") is None
+        or fetched[key].get("image_grid_thw") is None
+    }
+    if invalid_payload_keys:
+        keep = [i for i, ids in enumerate(image_ids_per_row) if not any(k in invalid_payload_keys for k in ids)]
+        print(
+            f"[RESOLVE] {len(invalid_payload_keys)}/{len(referenced)} images resolved to empty payloads from "
+            f"'{partition}'; dropping {n - len(keep)}/{n} rows and continuing.",
+            flush=True,
+        )
+        if not keep:
+            raise RuntimeError(
+                f"resolve_image_ids: ALL {n} rows reference empty image payloads in '{partition}'; "
+                "cannot recover this batch."
+            )
+        tensordict = tensordict[keep]
+        image_ids_per_row = [image_ids_per_row[i] for i in keep]
+        referenced = sorted({k for ids in image_ids_per_row for k in ids})
+        fetched = {k: fetched[k] for k in referenced}
+        ids_col = tensordict.get(IMAGE_IDS_KEY)
+        n = len(keep)
 
     # Train-side pixel integrity self-check (gated by VERL_PIXEL_FINGERPRINT=1). The store is
     # content-addressed: each key ends with content_key(pixel_values, image_grid_thw). This is the
@@ -462,11 +491,10 @@ async def resolve_image_ids(
 # old_log_prob / ref / update_actor passes within a step. Lazily created so the
 # default (dedup-off) path never allocates it.
 #
-# Size (in cached images) of the persistent cross-step LRU. Each cached payload is a full
-# ``pixel_values`` tensor (~10-20 MB), so at the old default of 2048 the cache alone pinned
-# ~25 GB of host RAM per worker. Default 0 = DISABLED: use a per-call cache instead (still dedups
-# within a batch, but drops afterward) so hot screenshots never accumulate across steps. Set
-# VERL_IMAGE_LRU_MAXSIZE>0 to re-enable the cross-step cache (trades host RAM for fewer TQ fetches).
+# Size (in cached images) of the persistent cross-step LRU. Default 0 = DISABLED:
+# no ImageLRU is used; each materialization fetches into a plain in-flight dict
+# and drops it after reconstruction. Set VERL_IMAGE_LRU_MAXSIZE>0 only for an
+# explicit cache experiment.
 _IMAGE_LRU_MAXSIZE = int(os.getenv("VERL_IMAGE_LRU_MAXSIZE", "0"))
 _WORKER_IMAGE_LRU: ImageLRU | None = None
 
