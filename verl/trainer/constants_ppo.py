@@ -76,10 +76,4 @@ def get_ppo_ray_runtime_env():
     # Always forward these at call-time, not import-time.
     for key in ("PYTHONHASHSEED", "VERL_FULL_DETERMINISM", "VLLM_BATCH_INVARIANT"):
         runtime_env["env_vars"][key] = os.environ.get(key, "0")
-    # These are often supplied by `ray job submit --runtime-env=...` to the job
-    # driver. Forward them into the `ray.init(runtime_env=...)` used by verl so
-    # newly-created actors/tasks see the same placement and TransferQueue config.
-    for key, value in os.environ.items():
-        if key.startswith("VERL_TQ_") or key in {"VERL_ROLLOUT_NODE_RESOURCE", "VERL_TRAIN_NODE_RESOURCE"}:
-            runtime_env["env_vars"][key] = value
     return runtime_env
