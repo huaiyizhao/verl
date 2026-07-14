@@ -135,6 +135,7 @@ class TaskRunnerV1:
         import transfer_queue as tq
 
         from verl.trainer.ppo.v1 import get_trainer_cls
+        from verl.utils.transferqueue_placement import patch_transfer_queue_simple_storage_placement
 
         trainer_cls = get_trainer_cls(config.trainer.v1.trainer_mode)
 
@@ -144,6 +145,7 @@ class TaskRunnerV1:
         self.config = config
 
         # initialize transfer queue
+        patch_transfer_queue_simple_storage_placement()
         tq.init(config.transfer_queue)
         try:
             self.trainer = trainer_cls(config=config)

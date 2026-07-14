@@ -1261,17 +1261,25 @@ class AgentLoopManager:
         self.agent_loop_workers = []
         num_workers = self.rollout_config.agent.num_workers
 
+        # Disaggregated placement: when the rollout node is tagged with a custom
+        # Ray resource, keep CPU-heavy agent-loop workers on that node instead of
+        # letting Ray spread them onto trainer nodes.
+        rollout_node_resource = os.getenv("VERL_ROLLOUT_NODE_RESOURCE") or None
+        if rollout_node_resource and rollout_node_resource.strip().lower() in {"0", "false", "none", "null", "off"}:
+            rollout_node_resource = None
         node_ids = [node["NodeID"] for node in ray.nodes() if node["Alive"] and node["Resources"].get("CPU", 0) > 0]
         for i in range(num_workers):
-            # Round-robin scheduling over the all nodes
-            node_id = node_ids[i % len(node_ids)]
+            worker_options = {"name": f"agent_loop_worker_{i}" + f"_{uuid4().hex[:8]}"}
+            if rollout_node_resource:
+                worker_options["resources"] = {rollout_node_resource: 0.001}
+            else:
+                # Round-robin scheduling over the all nodes
+                node_id = node_ids[i % len(node_ids)]
+                worker_options["scheduling_strategy"] = ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                    node_id=node_id, soft=True
+                )
             self.agent_loop_workers.append(
-                self.agent_loop_workers_class.options(
-                    name=f"agent_loop_worker_{i}" + f"_{uuid4().hex[:8]}",
-                    scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
-                        node_id=node_id, soft=True
-                    ),
-                ).remote(
+                self.agent_loop_workers_class.options(**worker_options).remote(
                     self.config,
                     self.llm_client,
                     self.teacher_client,

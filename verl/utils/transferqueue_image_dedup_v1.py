@@ -18,9 +18,9 @@ is opted into purely via config, by pointing at the classes here.
 
 * **Producer** — :class:`ImageDedupManagerTQ` (select with
   ``actor_rollout_ref.rollout.agent.agent_loop_manager_class``). Its worker stores
-  each unique processed image once in the ``rollout_images`` partition (keyed by
-  ``{uid}_{session_id}_{SHA1}``, i.e. deduped within the rollout) and writes only
-  an ``image_ids`` list per row.
+  each unique raw screenshot as compressed bytes once in the ``rollout_images``
+  partition (keyed by ``{uid}_{session_id}_{SHA1}``, i.e. deduped within the
+  rollout) and writes only an ``image_ids`` list per row.
 * **Lifecycle** — :class:`ImageDedupReplayBuffer` (select with
   ``trainer.v1.sampler.custom_sampler.{path,name}``). Each image is owned by one
   session, so it is cleared unconditionally once that session's rows leave the
@@ -29,8 +29,10 @@ is opted into purely via config, by pointing at the classes here.
   while the rows were still alive.
 * **Consume** — resolution of ``image_ids`` back into ``multi_modal_inputs`` lives
   in :func:`verl.utils.transferqueue_utils._async_meta_to_realdata` (the single
-  worker-side materialization point; not under ``ppo/v1/``), gated on the presence
-  of the ``image_ids`` column, so it is a no-op unless these classes are selected.
+  worker-side materialization point; not under ``ppo/v1/``). It fetches image
+  bytes and recomputes processor tensors on the trainer side, gated on the
+  presence of the ``image_ids`` column, so it is a no-op unless these classes are
+  selected.
 
 Because the worker/manager/replay-buffer methods have no finer extension seam, the
 overrides here copy the upstream method bodies and add the dedup steps; if upstream
@@ -65,6 +67,7 @@ from verl.utils.transferqueue_image_dedup import (
     encode_image_ids,
     fetch_image_ids,
     split_multimodal_per_image,
+    split_raw_images_per_image,
 )
 
 logger = logging.getLogger(__name__)
@@ -72,7 +75,7 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
 # ---------------------------------------------------------------------------
-# Producer: store deduped image references instead of inline pixel tensors
+# Producer: store deduped raw image-byte references instead of inline pixel tensors
 # ---------------------------------------------------------------------------
 # ``RolloutAgentLoopWorkerTQ`` is a ``@ray.remote`` ActorClass; recover its underlying
 # plain class so we can subclass it and re-apply ``ray.remote`` (the base manager
@@ -81,7 +84,7 @@ _PlainAgentLoopWorkerTQ = RolloutAgentLoopWorkerTQ.__ray_metadata__.modified_cla
 
 
 class _ImageDedupWorkerTQ(_PlainAgentLoopWorkerTQ):
-    """RolloutAgentLoopWorkerTQ that dedups per-image processor tensors on write (train only)."""
+    """RolloutAgentLoopWorkerTQ that stores per-image raw bytes on write (train only)."""
 
     async def _agent_loop_postprocess(self, output, validate, **kwargs) -> None:
         """Put agent loop outputs into TransferQueue (deduping images on the train path)."""
@@ -210,7 +213,11 @@ class _ImageDedupWorkerTQ(_PlainAgentLoopWorkerTQ):
                 # the batch shares the same keys for list_of_dict_to_tensordict; the
                 # consume hook restores multi_modal_inputs (empty dict when empty).
                 _t = time.perf_counter()
-                image_ids, payloads = split_multimodal_per_image(multi_modal_inputs, namespace=namespace)
+                raw_images = (output.multi_modal_data or {}).get("images")
+                image_ids, payloads = split_raw_images_per_image(raw_images, namespace=namespace)
+                if not payloads and multi_modal_inputs:
+                    # Compatibility fallback for non-image modalities or unusual agent outputs.
+                    image_ids, payloads = split_multimodal_per_image(multi_modal_inputs, namespace=namespace)
                 t_split += time.perf_counter() - _t
                 image_payloads.update(payloads)
                 # Store as a scalar string (""=text row), not a list — see IMAGE_IDS_KEY docs.

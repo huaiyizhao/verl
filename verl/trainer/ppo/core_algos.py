@@ -2430,7 +2430,8 @@ def compute_policy_loss_reinforce(
 
 # Diagnostic: locate WHY the rollout(vLLM) vs training(FSDP) per-token logprob gap — the k3-KL that
 # drives rollout_correction masking — is large. ON BY DEFAULT (set VERL_LOGPROB_DEBUG=0 to silence);
-# rank-0 only; capped at VERL_LOGPROB_DEBUG_MAX prints so it can't flood a long run. Read the stats:
+# rank-0 only; low/high-gap prints have separate caps so early clean batches don't hide later failures.
+# Read the stats:
 #   - mean_signed_d ~const & temp_slope ~ 0   -> uniform precision/kernel gap (bf16, FlashAttn vs SDPA)
 #   - temp_slope (diff ~ slope*logp) != 0     -> TEMPERATURE / logit-scaling mismatch (rollout vs train)
 #   - pos0_d >> rest_d                         -> first-token / prefill / BOS / mrope-start mismatch
@@ -2438,6 +2439,9 @@ def compute_policy_loss_reinforce(
 # The gap is measured over RESPONSE tokens (model-generated text), before rejection masking.
 _LOGPROB_DEBUG_COUNT = 0
 _LOGPROB_DEBUG_MAX = int(os.getenv("VERL_LOGPROB_DEBUG_MAX", "40"))
+_LOGPROB_DEBUG_HIGH_COUNT = 0
+_LOGPROB_DEBUG_HIGH_MAX = int(os.getenv("VERL_LOGPROB_DEBUG_HIGH_MAX", "40"))
+_LOGPROB_DEBUG_PRINT_COUNT = 0
 # Running (cross-micro-batch, per-process) accumulator for the entropy-asymmetry diagnostic in
 # compute_policy_loss_vanilla. Per-batch fractions are nan-prone (GRPO gives one advantage sign per
 # group -> n_pos or n_neg == 0), so we sum counts here and report running fractions.
@@ -2533,16 +2537,13 @@ def _maybe_debug_logprob_gap(
     """Print rollout(vLLM)-vs-training(FSDP) per-token logprob diagnostics for one micro-batch."""
     if os.getenv("VERL_LOGPROB_DEBUG", "1") in ("0", "false", "False", ""):
         return
-    global _LOGPROB_DEBUG_COUNT
-    if _LOGPROB_DEBUG_COUNT >= _LOGPROB_DEBUG_MAX:
-        return
+    global _LOGPROB_DEBUG_COUNT, _LOGPROB_DEBUG_HIGH_COUNT, _LOGPROB_DEBUG_PRINT_COUNT
     try:
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     except Exception:
         rank = 0
     if rank != 0:
         return
-    _LOGPROB_DEBUG_COUNT += 1
     with torch.no_grad():
         mask = response_mask.bool()
         if int(mask.sum()) == 0:
@@ -2576,18 +2577,36 @@ def _maybe_debug_logprob_gap(
         seq_valid = mask.sum(dim=1) > 0
         seq_mean_k3 = (seq_k3_sum / seq_len)[seq_valid]
         top1_share = (seq_k3_max / seq_k3_sum.clamp(min=1e-9))[seq_valid & (seq_k3_sum > 1e-9)]
-        frac_seq_over_thr = (seq_mean_k3 > 0.005).float().mean().item() if seq_mean_k3.numel() else 0.0
+        debug_threshold = float(os.getenv("VERL_LOGPROB_DEBUG_THRESHOLD", "0.005"))
+        high_gap = bool((seq_mean_k3 > debug_threshold).any()) if seq_mean_k3.numel() else False
+        if high_gap:
+            if _LOGPROB_DEBUG_HIGH_COUNT >= _LOGPROB_DEBUG_HIGH_MAX:
+                return
+            _LOGPROB_DEBUG_HIGH_COUNT += 1
+            logprob_gap_kind = "HIGH"
+        else:
+            if _LOGPROB_DEBUG_COUNT >= _LOGPROB_DEBUG_MAX:
+                return
+            _LOGPROB_DEBUG_COUNT += 1
+            logprob_gap_kind = "LOW"
+        _LOGPROB_DEBUG_PRINT_COUNT += 1
+        frac_seq_over_thr = (seq_mean_k3 > debug_threshold).float().mean().item() if seq_mean_k3.numel() else 0.0
+        max_seq_mean_k3 = seq_mean_k3.max().item() if seq_mean_k3.numel() else 0.0
         # gap split by token uncertainty (|rollout logprob|): confident (~prob 1) vs uncertain.
         conf = vroll.abs() < 0.1
         unc = vroll.abs() > 1.0
         conf_abs_d = abs_d[conf].mean().item() if bool(conf.any()) else 0.0
         unc_abs_d = abs_d[unc].mean().item() if bool(unc.any()) else 0.0
         print(
-            f"[LOGPROB_GAP] call#{_LOGPROB_DEBUG_COUNT} valid_tok={vd.numel()} "
+            f"[LOGPROB_GAP][{logprob_gap_kind}] call#{_LOGPROB_DEBUG_PRINT_COUNT} "
+            f"low_count={_LOGPROB_DEBUG_COUNT}/{_LOGPROB_DEBUG_MAX} "
+            f"high_count={_LOGPROB_DEBUG_HIGH_COUNT}/{_LOGPROB_DEBUG_HIGH_MAX} "
+            f"threshold={debug_threshold:.5f} valid_tok={vd.numel()} "
             f"mean_signed_d={vd.mean().item():+.5f} mean_abs_d={abs_d.mean().item():.5f} "
             f"max_abs_d={abs_d.max().item():.5f} std_d={vd.std().item():.5f} "
             f"frac>0.05={(abs_d > 0.05).float().mean().item():.3f} frac>0.1={(abs_d > 0.1).float().mean().item():.3f} "
-            f"| seq_mean_k3={seq_mean_k3.mean().item():.5f} seq_masked@0.005={frac_seq_over_thr:.3f} "
+            f"| seq_mean_k3={seq_mean_k3.mean().item():.5f} seq_max_k3={max_seq_mean_k3:.5f} "
+            f"seq_masked@thr={frac_seq_over_thr:.3f} "
             f"top1_k3_share={top1_share.mean().item() if top1_share.numel() else 0.0:.3f} "
             f"| abs_d[confident]={conf_abs_d:.5f} abs_d[uncertain]={unc_abs_d:.5f} "
             f"| temp_slope={temp_slope:+.4f} pos_slope={pos_slope:+.6f} pos0_d={pos0_d:+.5f} rest_d={rest_d:+.5f}",

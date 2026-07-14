@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Content-hash deduplication of processed multimodal image tensors for the V1
+"""Content-hash deduplication of multimodal image payloads for the V1
 TransferQueue (TQ) data plane.
 
 The V1 agent-loop worker stores each trajectory row's ``multi_modal_inputs``
@@ -20,24 +20,23 @@ multi-turn agent the same screenshot recurs across the sliding-window turns and
 across the ``rollout.n`` GRPO samples of a prompt, so inline storage duplicates
 large pixel tensors many times.
 
-This module stores each *unique* processed image once in a separate TQ
-partition (:data:`PARTITION_IMAGES`) keyed by ``{session}_{SHA1}`` (the SHA1 of
-its content, namespaced by the owning rollout session), and lets a trajectory row
-carry only a small :data:`IMAGE_IDS_KEY` list of those keys in place of the pixel
-tensors:
+This module stores each *unique* raw screenshot once in a separate TQ partition
+(:data:`PARTITION_IMAGES`) keyed by ``{session}_{SHA1}`` (the SHA1 of its
+compressed image bytes, namespaced by the owning rollout session), and lets a
+trajectory row carry only a small :data:`IMAGE_IDS_KEY` list of those keys in
+place of the pixel tensors:
 
-* **Producer** (agent-loop worker): :func:`split_multimodal_per_image` slices a
-  turn's ``multi_modal_inputs`` into per-image payloads keyed by content hash,
-  namespaced by the ``{uid}_{session_id}`` of the rollout that produced them; the
-  worker ``kv_put``\\s unique payloads into ``rollout_images`` and stores the
-  row's ``image_ids`` instead of ``multi_modal_inputs``. Dedup is **within a
-  rollout** (the dominant redundancy — a screenshot recurs across the sliding-
-  window turns of one session); sibling GRPO sessions of the same prompt no longer
-  share storage, which removes all cross-rollout coordination.
+* **Producer** (agent-loop worker): :func:`split_raw_images_per_image` encodes
+  the raw PIL screenshots as compressed bytes, keyed by content hash, namespaced
+  by the ``{uid}_{session_id}`` of the rollout that produced them; the worker
+  ``kv_put``\\s unique payloads into ``rollout_images`` and stores the row's
+  ``image_ids`` instead of ``multi_modal_inputs``. Dedup is **within a rollout**
+  (the dominant redundancy — a screenshot recurs across the sliding-window turns
+  of one session); sibling GRPO sessions of the same prompt no longer share
+  storage, which removes all cross-rollout coordination.
 * **Consumer** (inside the worker that materializes a TQ batch):
-  :func:`resolve_image_ids` fetches the referenced images back (deduped across
-  the batch, served from a per-worker :class:`ImageLRU`) and reassembles
-  ``multi_modal_inputs`` per row.
+  :func:`resolve_image_ids` fetches the referenced image bytes back, decodes them
+  to PIL images, and recomputes ``multi_modal_inputs`` with the local processor.
 * **Lifecycle**: because each image key is owned by exactly one session, an image
   is cleared (:func:`clear_images`) unconditionally once that session's rows leave
   the replay buffer — no shared refcount actor is needed.
@@ -49,12 +48,12 @@ selecting the subclasses in :mod:`verl.utils.transferqueue_image_dedup_v1`
 carries ``image_ids`` and the consume hook is a no-op, so behavior is exactly
 upstream. This module holds the shared helpers used by those subclasses.
 
-The pure tensor helpers (:func:`content_key`, :func:`split_multimodal_per_image`,
-:func:`reconstruct_row_multimodal`) depend only on ``torch`` and are unit-tested
-without a running TransferQueue.
+The processed-tensor helpers are still kept as a compatibility fallback for old
+in-flight queues, but the default producer path stores raw image bytes.
 """
 
 import hashlib
+import io
 import logging
 import os
 import time
@@ -93,6 +92,12 @@ PARTITION_IMAGES_VAL = "rollout_images_val"
 IMAGE_IDS_KEY = "image_ids"
 IMAGE_IDS_DELIM = "\x1f"
 MULTI_MODAL_INPUTS_KEY = "multi_modal_inputs"
+RAW_IMAGE_BYTES_KEY = "image_bytes"
+RAW_IMAGE_FORMAT_KEY = "image_format"
+RAW_IMAGE_PAYLOAD_KIND = "raw_image_bytes"
+
+_RECOMPUTE_PROCESSOR = None
+_RECOMPUTE_TOKENIZER = None
 
 
 def encode_image_ids(image_ids: list[str]) -> str:
@@ -127,6 +132,89 @@ def content_key(*tensors: torch.Tensor) -> str:
         digest.update(str((tuple(t.shape), str(t.dtype))).encode("utf-8"))
         digest.update(a.numpy().tobytes())
     return f"sha1:{digest.hexdigest()}"
+
+
+def _content_key_bytes(raw: bytes) -> str:
+    return f"sha1:{hashlib.sha1(raw).hexdigest()}"
+
+
+def _image_to_bytes_tensor(image: Any) -> torch.Tensor:
+    """Encode one PIL image as compressed bytes stored in a uint8 tensor."""
+    from PIL import Image
+
+    if not isinstance(image, Image.Image):
+        raise TypeError(f"expected PIL.Image.Image, got {type(image).__name__}")
+
+    image_format = os.getenv("VERL_TQ_IMAGE_FORMAT", "PNG").upper()
+    buf = io.BytesIO()
+    save_kwargs: dict[str, Any] = {}
+    if image_format == "PNG":
+        save_kwargs["compress_level"] = int(os.getenv("VERL_TQ_IMAGE_PNG_COMPRESS_LEVEL", "1"))
+    elif image_format == "WEBP":
+        save_kwargs["lossless"] = os.getenv("VERL_TQ_IMAGE_WEBP_LOSSLESS", "1").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        save_kwargs["quality"] = int(os.getenv("VERL_TQ_IMAGE_WEBP_QUALITY", "95"))
+    image.convert("RGB").save(buf, format=image_format, **save_kwargs)
+    raw = buf.getvalue()
+    return torch.frombuffer(bytearray(raw), dtype=torch.uint8).clone()
+
+
+def _bytes_from_payload_value(value: Any) -> bytes:
+    from tensordict.tensorclass import NonTensorData
+
+    value = value.data if isinstance(value, NonTensorData) else value
+    value = _densify(value)
+    if isinstance(value, bytes | bytearray | memoryview):
+        return bytes(value)
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().contiguous().numpy().tobytes()
+    raise TypeError(f"unsupported image bytes payload type: {type(value).__name__}")
+
+
+def _payload_is_raw_image(payload: dict[str, Any]) -> bool:
+    return RAW_IMAGE_BYTES_KEY in payload
+
+
+def _decode_payload_image(payload: dict[str, Any]):
+    from PIL import Image
+
+    raw = _bytes_from_payload_value(payload[RAW_IMAGE_BYTES_KEY])
+    return Image.open(io.BytesIO(raw)).convert("RGB")
+
+
+def split_raw_images_per_image(
+    images: list[Any] | None,
+    namespace: str = "",
+) -> tuple[list[str], dict[str, dict[str, Any]]]:
+    """Store raw screenshots as compressed bytes keyed by content hash.
+
+    This is the memory-saving producer path: TransferQueue stores compressed
+    image bytes instead of Qwen pixel feature tensors. The trainer recomputes
+    processor tensors after fetching the bytes.
+    """
+    if not images:
+        return [], {}
+
+    image_format = os.getenv("VERL_TQ_IMAGE_FORMAT", "PNG").upper()
+    prefix = f"{namespace}_" if namespace else ""
+    image_ids: list[str] = []
+    payloads: dict[str, dict[str, Any]] = {}
+    for image in images:
+        image_bytes = _image_to_bytes_tensor(image)
+        raw = image_bytes.detach().cpu().contiguous().numpy().tobytes()
+        image_id = prefix + _content_key_bytes(raw)
+        image_ids.append(image_id)
+        if image_id not in payloads:
+            payloads[image_id] = {
+                RAW_IMAGE_BYTES_KEY: image_bytes,
+                RAW_IMAGE_FORMAT_KEY: image_format,
+                "payload_kind": RAW_IMAGE_PAYLOAD_KIND,
+            }
+    return image_ids, payloads
 
 
 def split_multimodal_per_image(
@@ -198,25 +286,122 @@ def _densify(t: Any) -> Any:
     return t
 
 
+def _get_recompute_processor_and_tokenizer():
+    global _RECOMPUTE_PROCESSOR, _RECOMPUTE_TOKENIZER
+    if _RECOMPUTE_PROCESSOR is not None:
+        return _RECOMPUTE_PROCESSOR, _RECOMPUTE_TOKENIZER
+
+    model_path = (
+        os.getenv("VERL_TQ_IMAGE_PROCESSOR_PATH")
+        or os.getenv("HF_MODEL_PATH")
+        or os.getenv("VERL_LOGPROB_DEBUG_TOKENIZER")
+    )
+    if not model_path:
+        raise RuntimeError(
+            "Raw image payloads require a processor to recompute multi_modal_inputs. "
+            "Set VERL_TQ_IMAGE_PROCESSOR_PATH to the HF model path."
+        )
+
+    from verl.utils import hf_processor, hf_tokenizer
+
+    processor = hf_processor(model_path, trust_remote_code=True, use_fast=True)
+    if processor is None:
+        raise RuntimeError(f"Failed to load multimodal processor from {model_path!r}")
+    tokenizer = getattr(processor, "tokenizer", None) or hf_tokenizer(model_path, trust_remote_code=True, use_fast=True)
+    _RECOMPUTE_PROCESSOR = processor
+    _RECOMPUTE_TOKENIZER = tokenizer
+    print(f"[TQ_IMAGE_RECOMPUTE] loaded processor from {model_path}", flush=True)
+    return _RECOMPUTE_PROCESSOR, _RECOMPUTE_TOKENIZER
+
+
+def _row_token_ids(tensordict: Any, row_idx: int) -> list[int]:
+    col = tensordict.get("input_ids")
+    value = _densify(col[row_idx])
+    if hasattr(value, "data") and not isinstance(value, torch.Tensor):
+        value = value.data
+    if not isinstance(value, torch.Tensor):
+        return [int(x) for x in value]
+    value = value.detach().cpu()
+    if value.dim() > 1:
+        value = value.reshape(-1)
+    return [int(x) for x in value.tolist()]
+
+
+def _row_non_tensor_value(tensordict: Any, key: str, row_idx: int) -> Any:
+    from tensordict.tensorclass import NonTensorData
+
+    if key not in tensordict.keys():
+        return None
+    value = tensordict.get(key)[row_idx]
+    return value.data if isinstance(value, NonTensorData) else value
+
+
+def _recompute_row_multimodal(
+    *,
+    image_ids: list[str],
+    fetched: dict[str, dict[str, Any]],
+    text: str,
+    mm_processor_kwargs: dict[str, Any] | None,
+    processor: Any,
+) -> dict[str, Any]:
+    from verl.utils.tokenizer import build_multimodal_processor_inputs
+
+    images = [_decode_payload_image(fetched[key]) for key in image_ids]
+    multi_modal_inputs = build_multimodal_processor_inputs(
+        processor,
+        text=[text],
+        images=images,
+        mm_processor_kwargs=mm_processor_kwargs,
+    )
+    multi_modal_inputs.pop("input_ids", None)
+    multi_modal_inputs.pop("attention_mask", None)
+    multi_modal_inputs = dict(multi_modal_inputs.convert_to_tensors("pt"))
+    image_grid_thw = multi_modal_inputs.get("image_grid_thw")
+    if image_grid_thw is not None:
+        multi_modal_inputs["images_seqlens"] = torch.repeat_interleave(
+            image_grid_thw[:, 1] * image_grid_thw[:, 2], image_grid_thw[:, 0]
+        )
+    return multi_modal_inputs
+
+
 def reconstruct_row_multimodal(
     image_ids_per_row: list[list[str]],
     fetched: dict[str, dict[str, Any]],
+    *,
+    row_texts: list[str] | None = None,
+    row_mm_processor_kwargs: list[dict[str, Any] | None] | None = None,
+    processor: Any = None,
 ) -> list[dict[str, Any] | None]:
     """Reassemble per-row ``multi_modal_inputs`` from deduped image payloads.
 
-    Inverse of :func:`split_multimodal_per_image`: a row's images are
-    concatenated back in reference order (``pixel_values`` along patches,
-    ``image_grid_thw`` / ``images_seqlens`` along the image axis). Rows with no
-    images yield ``None``.
+    For new raw-image payloads, this decodes image bytes and recomputes processor
+    tensors per row. For legacy processed-tensor payloads, it falls back to the
+    previous concatenate-in-reference-order behavior.
 
     Args:
         image_ids_per_row: per-row list of SHA1 image keys.
         fetched: mapping ``{image_key: {"pixel_values", "image_grid_thw", ...}}``.
     """
     rows: list[dict[str, Any] | None] = []
-    for ids in image_ids_per_row:
+    for row_idx, ids in enumerate(image_ids_per_row):
         if not ids:
             rows.append(None)
+            continue
+        is_raw = [_payload_is_raw_image(fetched[key]) for key in ids]
+        if any(is_raw):
+            if not all(is_raw):
+                raise ValueError("mixed raw-image and processed-tensor payloads in one row are unsupported")
+            if processor is None or row_texts is None:
+                raise RuntimeError("raw-image payload reconstruction requires processor and row_texts")
+            rows.append(
+                _recompute_row_multimodal(
+                    image_ids=ids,
+                    fetched=fetched,
+                    text=row_texts[row_idx],
+                    mm_processor_kwargs=(row_mm_processor_kwargs or [None] * len(image_ids_per_row))[row_idx],
+                    processor=processor,
+                )
+            )
             continue
         parts: dict[str, list[Any]] = {}
         for key in ids:
@@ -418,8 +603,10 @@ async def resolve_image_ids(
         key
         for key in referenced
         if fetched.get(key) is None
-        or fetched[key].get("pixel_values") is None
-        or fetched[key].get("image_grid_thw") is None
+        or (
+            fetched[key].get(RAW_IMAGE_BYTES_KEY) is None
+            and (fetched[key].get("pixel_values") is None or fetched[key].get("image_grid_thw") is None)
+        )
     }
     if invalid_payload_keys:
         keep = [i for i, ids in enumerate(image_ids_per_row) if not any(k in invalid_payload_keys for k in ids)]
@@ -453,6 +640,17 @@ async def resolve_image_ids(
                 break
             pv = payload.get("pixel_values")
             grid = payload.get("image_grid_thw")
+            if pv is None and payload.get(RAW_IMAGE_BYTES_KEY) is not None:
+                raw = _bytes_from_payload_value(payload[RAW_IMAGE_BYTES_KEY])
+                recomputed = _content_key_bytes(raw)
+                ok = key.endswith(recomputed)
+                print(
+                    f"[PIXEL_FP] key=...{key[-16:]} raw_bytes_hash_match={ok} "
+                    f"{'OK' if ok else 'MISMATCH<-store returned WRONG image bytes for this key!'} "
+                    f"bytes={len(raw)}",
+                    flush=True,
+                )
+                continue
             if pv is None or grid is None:
                 continue
             _PIXFP_DBG[0] += 1
@@ -468,8 +666,26 @@ async def resolve_image_ids(
                 flush=True,
             )
 
+    raw_payload_present = any(_payload_is_raw_image(fetched[key]) for key in referenced)
+    processor = None
+    row_texts = None
+    row_mm_processor_kwargs = None
+    if raw_payload_present:
+        processor, tokenizer = _get_recompute_processor_and_tokenizer()
+        row_texts = [tokenizer.decode(_row_token_ids(tensordict, i), skip_special_tokens=True) for i in range(n)]
+        row_mm_processor_kwargs = []
+        for i in range(n):
+            value = _row_non_tensor_value(tensordict, "mm_processor_kwargs", i)
+            row_mm_processor_kwargs.append(value if isinstance(value, dict) else None)
+
     _t = time.perf_counter()
-    mm_per_row = reconstruct_row_multimodal(image_ids_per_row, fetched)
+    mm_per_row = reconstruct_row_multimodal(
+        image_ids_per_row,
+        fetched,
+        row_texts=row_texts,
+        row_mm_processor_kwargs=row_mm_processor_kwargs,
+        processor=processor,
+    )
     assign_non_tensor_stack(tensordict, MULTI_MODAL_INPUTS_KEY, [m if m else {} for m in mm_per_row])
     del tensordict[IMAGE_IDS_KEY]
     t_reconstruct = time.perf_counter() - _t
