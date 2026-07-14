@@ -72,7 +72,8 @@ class PPOTrainerSeparateAsync(PPOTrainer):
 
         # initialize standalone rollout
         # TODO: make initialization parallel with super().init()
-        hybrid_num_replicas = len(self.llm_server_manager.rollout_replicas)
+        llm_server_manager = self.llm_server_manager
+        hybrid_num_replicas = len(llm_server_manager.rollout_replicas) if llm_server_manager is not None else 0
         self.standalone_server_manager: LLMServerManager = LLMServerManager.create(
             config=self.config, start_rank=hybrid_num_replicas
         )
@@ -85,9 +86,17 @@ class PPOTrainerSeparateAsync(PPOTrainer):
             replicas=self.standalone_server_manager.get_replicas(),
         )
 
-        # hybrid engine is in rollout mode after initialization
-        self.current_mode = HybridEngineMode.ROLLOUT
-        self.add_replicas_to_balancer()
+        # hybrid engine is optional in separate async. When disabled, generation uses only
+        # the standalone rollout resource pool configured by rollout.nnodes/n_gpus_per_node.
+        if self._has_hybrid_rollout():
+            self.current_mode = HybridEngineMode.ROLLOUT
+            self.add_replicas_to_balancer()
+        else:
+            self.current_mode = HybridEngineMode.TRAINER
+            logger.info("hybrid rollout replicas disabled; separate async is running standalone-only rollout")
+
+    def _has_hybrid_rollout(self) -> bool:
+        return self.llm_server_manager is not None and self.checkpoint_manager is not None
 
     def get_llm_client(self):
         # get server client from standalone rollout
@@ -96,7 +105,9 @@ class PPOTrainerSeparateAsync(PPOTrainer):
     def on_init_end(self):
         # update weights after loading checkpoint
         self.standalone_checkpoint_manager.update_weights(self.global_steps)
-        self.checkpoint_manager.update_weights(self.global_steps)
+        checkpoint_manager = self.checkpoint_manager
+        if checkpoint_manager is not None:
+            checkpoint_manager.update_weights(self.global_steps)
 
     def on_train_begin(self):
         # Read from the active trainer mode's config section so subclasses (e.g. fully_async)
@@ -107,16 +118,22 @@ class PPOTrainerSeparateAsync(PPOTrainer):
         logger.info(f"Added {num_warmup_batches} warmup batches to the agent loop manager")
 
     def on_validate_begin(self):
+        if not self._has_hybrid_rollout():
+            return
         if self.current_mode == HybridEngineMode.TRAINER:
             logger.info("Switching hybrid engine to rollout mode for validation")
             self.switch_to_rollout()
 
     def on_sample_begin(self):
+        if not self._has_hybrid_rollout():
+            return
         if self.current_mode == HybridEngineMode.TRAINER and self.should_switch_to_rollout():
             logger.info("Switching hybrid engine to rollout mode for generation")
             self.switch_to_rollout()
 
     def on_sample_end(self):
+        if not self._has_hybrid_rollout():
+            return
         if self.current_mode == HybridEngineMode.ROLLOUT:
             logger.info("Switching hybrid engine to trainer mode for training")
             self.switch_to_trainer()
@@ -130,29 +147,39 @@ class PPOTrainerSeparateAsync(PPOTrainer):
                 self.standalone_checkpoint_manager.update_weights(self.global_steps)
 
     def switch_to_rollout(self):
+        checkpoint_manager = self.checkpoint_manager
+        if self.llm_server_manager is None or checkpoint_manager is None:
+            return
         # TODO: disable auto offload in config and offload according to the switch strategy
-        self.checkpoint_manager.update_weights(self.global_steps)
-        self.checkpoint_manager.resume_generation_replicas()
+        checkpoint_manager.update_weights(self.global_steps)
+        checkpoint_manager.resume_generation_replicas()
         self.add_replicas_to_balancer()
         self.current_mode = HybridEngineMode.ROLLOUT
 
     def switch_to_trainer(self):
+        checkpoint_manager = self.checkpoint_manager
+        if self.llm_server_manager is None or checkpoint_manager is None:
+            return
         # TODO: disable auto offload in config and offload according to the switch strategy
         self.remove_replicas_from_balancer()
-        self.checkpoint_manager.abort_replicas()
-        self.checkpoint_manager.sleep_replicas()
+        checkpoint_manager.abort_replicas()
+        checkpoint_manager.sleep_replicas()
         self.current_mode = HybridEngineMode.TRAINER
 
     def add_replicas_to_balancer(self):
+        llm_server_manager = self.llm_server_manager
+        if llm_server_manager is None:
+            return
         global_load_balancer = self.standalone_server_manager.global_load_balancer
-        servers = dict(
-            zip(self.llm_server_manager.server_addresses, self.llm_server_manager.server_handles, strict=True)
-        )
+        servers = dict(zip(llm_server_manager.server_addresses, llm_server_manager.server_handles, strict=True))
         ray.get(global_load_balancer.add_servers.remote(servers))
 
     def remove_replicas_from_balancer(self):
+        llm_server_manager = self.llm_server_manager
+        if llm_server_manager is None:
+            return
         global_load_balancer = self.standalone_server_manager.global_load_balancer
-        ray.get(global_load_balancer.remove_servers.remote(self.llm_server_manager.server_addresses))
+        ray.get(global_load_balancer.remove_servers.remote(llm_server_manager.server_addresses))
 
     def should_switch_to_rollout(self):
         # TODO: Implement switch strategy by checking replay buffer and switch overhead

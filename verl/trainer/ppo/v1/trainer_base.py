@@ -261,29 +261,38 @@ class PPOTrainer(ABC):
             self.teacher_model_manager = None
             self.distillation_config = None
 
-        # 9. initialize agent loop manager
-        self.llm_server_manager: LLMServerManager = LLMServerManager.create(
-            config=self.config, worker_group=self.actor_rollout_wg, rollout_resource_pool=actor_rollout_resource_pool
-        )
+        # 9. initialize trainer-side rollout replicas when hybrid engine is enabled.
+        self.llm_server_manager: LLMServerManager | None = None
+        self.checkpoint_manager: CheckpointEngineManager | None = None
+        if self.config.actor_rollout_ref.hybrid_engine:
+            self.llm_server_manager = LLMServerManager.create(
+                config=self.config,
+                worker_group=self.actor_rollout_wg,
+                rollout_resource_pool=actor_rollout_resource_pool,
+            )
 
-        # 10. initialize checkpoint engine manager
-        checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
-        checkpoint_engine_config.backend = "naive"
-        self.checkpoint_manager: CheckpointEngineManager = CheckpointEngineManager(
-            config=checkpoint_engine_config,
-            actor_wg=self.actor_rollout_wg,
-            replicas=self.llm_server_manager.get_replicas(),
-        )
-        logger.info("checkpoint engine manager initialized")
+            # 10. initialize checkpoint engine manager
+            checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
+            checkpoint_engine_config.backend = "naive"
+            self.checkpoint_manager = CheckpointEngineManager(
+                config=checkpoint_engine_config,
+                actor_wg=self.actor_rollout_wg,
+                replicas=self.llm_server_manager.get_replicas(),
+            )
+            logger.info("hybrid checkpoint engine manager initialized")
 
-        # sleep all replicas to load checkpoint
-        self.checkpoint_manager.sleep_replicas()
+            # sleep all replicas to load checkpoint
+            self.checkpoint_manager.sleep_replicas()
+        else:
+            logger.info("hybrid engine disabled; skipping trainer-side rollout replicas")
         self._load_checkpoint()
 
         logger.info("all initialize finished, ready to fit")
 
     def get_llm_client(self) -> LLMServerClient:
         """Get the LLM server client for rollout generation."""
+        if self.llm_server_manager is None:
+            raise RuntimeError("No hybrid LLM server is available; use a trainer mode with standalone rollout.")
         return self.llm_server_manager.get_client()
 
     def get_teacher_client(self) -> Optional[dict[str, LLMServerClient]]:
@@ -776,9 +785,11 @@ class PPOTrainer(ABC):
 
             # 3. [OPTIONAL] compute reward score with colocated reward model
             if self.reward_loop_manager.reward_loop_worker_handles is None:
-                self.checkpoint_manager.sleep_replicas()
+                if self.checkpoint_manager is not None:
+                    self.checkpoint_manager.sleep_replicas()
                 batch = self._compute_reward_colocate(batch)
-                self.checkpoint_manager.update_weights()
+                if self.checkpoint_manager is not None:
+                    self.checkpoint_manager.update_weights()
 
             # 4. collect necessary data for logging
             # For multi-output agent loops, only use the final output per session for metrics.
