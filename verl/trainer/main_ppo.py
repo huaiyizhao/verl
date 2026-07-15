@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import logging
 import os
 from pprint import pprint
@@ -18,6 +19,7 @@ from pprint import pprint
 import hydra
 import ray
 from omegaconf import DictConfig, OmegaConf, open_dict
+from ray._private.runtime_env.constants import RAY_JOB_CONFIG_JSON_ENV_VAR
 
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
@@ -27,6 +29,20 @@ from verl.utils.import_utils import load_class_from_fqn
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+
+def _job_runtime_env_var_keys() -> set[str]:
+    """Env var keys already supplied by `ray job submit --runtime-env`.
+
+    Ray rejects duplicate env var keys between the Job runtime env and the
+    Driver's `ray.init(runtime_env=...)`, even if the values are identical.
+    """
+    try:
+        job_config = json.loads(os.environ.get(RAY_JOB_CONFIG_JSON_ENV_VAR, "{}"))
+    except json.JSONDecodeError:
+        return set()
+    env_vars = job_config.get("runtime_env", {}).get("env_vars", {})
+    return set(env_vars) if isinstance(env_vars, dict) else set()
 
 
 # Define a function to run the PPO-like training process
@@ -68,25 +84,24 @@ def run_ppo(config, task_runner_class) -> None:
                 runtime_env_vars["TRANSFER_QUEUE_ENABLE"] = "1"
             runtime_env_kwargs["env_vars"] = runtime_env_vars
 
-        # `ray job submit --runtime-env=...` applies env vars to the driver, but
-        # verl creates a second Ray runtime_env for its actors. Forward placement
-        # and TransferQueue settings so rollout-side actors and storage actors see
-        # the same node-resource policy as the driver.
+        # `ray job submit --runtime-env=...` applies env vars to the driver and Ray
+        # merges that Job runtime_env into child actors. Only forward placement/TQ
+        # vars that came from the launch shell rather than the Job runtime_env;
+        # otherwise ray.init fails with duplicate env-var conflicts.
+        job_runtime_env_keys = _job_runtime_env_var_keys()
         runtime_env_vars = runtime_env_kwargs.get("env_vars", {})
         if isinstance(runtime_env_vars, DictConfig):
             with open_dict(runtime_env_vars):
                 for key, value in os.environ.items():
-                    if key.startswith("VERL_TQ_") or key in {
-                        "VERL_ROLLOUT_NODE_RESOURCE",
-                        "VERL_TRAIN_NODE_RESOURCE",
-                    }:
+                    if key in job_runtime_env_keys:
+                        continue
+                    if key.startswith("VERL_TQ_") or key in {"VERL_ROLLOUT_NODE_RESOURCE", "VERL_TRAIN_NODE_RESOURCE"}:
                         runtime_env_vars[key] = value
         else:
             for key, value in os.environ.items():
-                if key.startswith("VERL_TQ_") or key in {
-                    "VERL_ROLLOUT_NODE_RESOURCE",
-                    "VERL_TRAIN_NODE_RESOURCE",
-                }:
+                if key in job_runtime_env_keys:
+                    continue
+                if key.startswith("VERL_TQ_") or key in {"VERL_ROLLOUT_NODE_RESOURCE", "VERL_TRAIN_NODE_RESOURCE"}:
                     runtime_env_vars[key] = value
         runtime_env_kwargs["env_vars"] = runtime_env_vars
 
