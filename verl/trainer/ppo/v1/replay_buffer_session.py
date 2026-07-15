@@ -87,8 +87,13 @@ class SessionReplayBuffer(ReplayBuffer):
         # partition_id => {prompt_uid: set(session_id)}, completed sessions that SUCCEEDED. A prompt
         # with an empty success set (once complete) is all-failed -> discarded + replaced.
         self.session_success: dict[str, dict[str, set]] = defaultdict(lambda: defaultdict(set))
-        # partition_id => {prompt_uid: set(marker_key)}, per-session markers to clear on sample().
+        # partition_id => {prompt_uid: set(marker_key)}, per-session completion markers.
         self.session_marker_keys: dict[str, dict[str, set]] = defaultdict(lambda: defaultdict(set))
+        # In fully_async train mode, sampled prompts must keep occupying the in-flight budget until
+        # the trainer finishes the step and syncs weights. Track their control-plane keys locally so
+        # they can be cleared at sync time instead of inside sample().
+        self.sampled_prompt_uids: dict[str, set[str]] = defaultdict(set)
+        self.sampled_control_keys: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
 
     def _sync_metadata_from_transfer_queue(self):
         """Sync the metadata from TransferQueue (prompt ``n`` + per-session completion markers)."""
@@ -134,7 +139,25 @@ class SessionReplayBuffer(ReplayBuffer):
         discards it via :meth:`dead_prompt_keys` and feeds a replacement.)
         """
         success = self.session_success[partition_id]
-        return {uid for uid in self._complete_uids(partition_id) if success.get(uid)}
+        sampled = self.sampled_prompt_uids[partition_id]
+        return {uid for uid in self._complete_uids(partition_id) if success.get(uid) and uid not in sampled}
+
+    def release_sampled_control_keys(self, partition_id: str = "train", prompt_uids: list[str] | None = None) -> int:
+        """Clear sampled prompt/session markers, freeing in-flight budget slots.
+
+        In fully_async this should run after trainer-side weight sync, not when
+        replay_buffer.sample() hands the rows to the trainer.
+        """
+        with self._meta_lock:
+            if prompt_uids is None:
+                prompt_uids = list(self.sampled_prompt_uids[partition_id])
+            keys: set[str] = set()
+            for uid in prompt_uids:
+                keys.update(self.sampled_control_keys[partition_id].pop(uid, set()))
+            if keys:
+                tq.kv_clear(partition_id=partition_id, keys=list(keys))
+            self.sampled_prompt_uids[partition_id].difference_update(prompt_uids)
+            return len(keys)
 
     def dead_prompt_keys(self, partition_id: str = "train") -> list[str]:
         """The TransferQueue keys of all-failed prompts (complete but no successful session).
@@ -212,12 +235,21 @@ class SessionReplayBuffer(ReplayBuffer):
                     selected_prompt_uids = sampleable_keys[:batch_size]
                     selected = set(selected_prompt_uids)
 
-                    # Clear the prompt metadata keys and their per-session completion markers. The
-                    # trajectory data keys are cleared by the trainer after the batch is consumed.
+                    # In fully_async train mode, keep prompt/session markers until the trainer has
+                    # consumed the batch and synced weights. This preserves the intended in-flight
+                    # budget: sampled-but-not-yet-trained prompts still occupy a slot.
                     marker_keys = []
                     for uid in selected_prompt_uids:
                         marker_keys.extend(self.session_marker_keys[partition_id].get(uid, ()))
-                    tq.kv_clear(partition_id=partition_id, keys=list(selected_prompt_uids) + marker_keys)
+                    if self.trainer_mode == "fully_async" and partition_id == "train":
+                        for uid in selected_prompt_uids:
+                            self.sampled_prompt_uids[partition_id].add(uid)
+                            self.sampled_control_keys[partition_id][uid].add(uid)
+                            self.sampled_control_keys[partition_id][uid].update(
+                                self.session_marker_keys[partition_id].get(uid, ())
+                            )
+                    else:
+                        tq.kv_clear(partition_id=partition_id, keys=list(selected_prompt_uids) + marker_keys)
 
                     # Collect the prompt's trajectory rows. Failed sessions wrote no data, so every
                     # data key of a usable prompt belongs to a successful session — no filtering.

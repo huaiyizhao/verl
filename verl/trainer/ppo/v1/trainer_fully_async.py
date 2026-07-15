@@ -323,6 +323,15 @@ class PPOTrainerFullyAsync(PPOTrainerSeparateAsync):
             fallback_rollout_key = key
         return prompt_key, str(tag.get("rollout_group_id", fallback_rollout_key))
 
+    def _release_sampled_inflight(self, partition_id: str = "train", row_keys: list | None = None) -> int:
+        release_fn = getattr(self.replay_buffer, "release_sampled_control_keys", None)
+        if release_fn is None:
+            return 0
+        prompt_uids = None
+        if row_keys is not None:
+            prompt_uids = sorted({str(key).split("_", 1)[0] for key in row_keys})
+        return int(release_fn(partition_id=partition_id, prompt_uids=prompt_uids))
+
     def _filter_reward_std_groups(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta | None:
         """Drop prompt groups whose rollout rewards have zero std before trainer forward work."""
         try:
@@ -409,6 +418,7 @@ class PPOTrainerFullyAsync(PPOTrainerSeparateAsync):
             except Exception:
                 logger.debug("Failed to clear images for reward-std filtered rows", exc_info=True)
             tq.kv_clear(partition_id=batch.partition_id, keys=dropped_keys)
+            self._release_sampled_inflight(partition_id=batch.partition_id, row_keys=dropped_keys)
 
         if not kept_keys:
             return None
@@ -427,12 +437,20 @@ class PPOTrainerFullyAsync(PPOTrainerSeparateAsync):
             self._feeder_paused.set()
         try:
             super().on_step_end()  # separate_async: standalone update_weights on sync steps
+            if is_sync_step:
+                with self._param_version_lock:
+                    self._param_version = self.global_steps
+                released = self._release_sampled_inflight(partition_id="train")
+                if released:
+                    print(
+                        f"Released {released} sampled in-flight control keys after weight sync at step "
+                        f"{self.global_steps}",
+                        flush=True,
+                    )
         finally:
             if is_sync_step:
                 self._feeder_paused.clear()
                 print(f"Resumed streaming feeder after weight sync at step {self.global_steps}", flush=True)
-        with self._param_version_lock:
-            self._param_version = self.global_steps
         if _STEP_PROFILE:
             # logged here (not in step()) so update_weights/save_checkpoint, which run after step()
             # returns, are included in self.timing_raw.
