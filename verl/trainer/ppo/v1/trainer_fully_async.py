@@ -27,17 +27,22 @@ make that a no-op once the feeder owns generation (see :meth:`_add_batch_to_gene
 """
 
 import logging
+import math
 import os
 import threading
 import uuid
+from collections import defaultdict
 
 import numpy as np
+import torch
 import transfer_queue as tq
 from omegaconf import DictConfig
+from transfer_queue import KVBatchMeta
 
 from verl.trainer.ppo.v1.trainer_base import register_trainer
 from verl.trainer.ppo.v1.trainer_separate_async import PPOTrainerSeparateAsync
 from verl.utils import tensordict_utils as tu
+from verl.utils.debug import marked_timer
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -220,7 +225,197 @@ class PPOTrainerFullyAsync(PPOTrainerSeparateAsync):
         # fail fast instead of hanging in replay_buffer.sample if the feeder died
         if self._feeder_error:
             raise RuntimeError("Streaming feeder thread died; aborting training")
-        return super().step(metrics, timing_raw)
+        if not self._reward_std_filter_enabled():
+            return super().step(metrics, timing_raw)
+        return self._step_with_reward_std_filter(metrics, timing_raw)
+
+    def _step_with_reward_std_filter(self, metrics: dict, timing_raw: dict) -> KVBatchMeta:
+        # 1. add batch to generate. In fully_async this is a no-op after the feeder starts.
+        self._add_batch_to_generate()
+
+        reward_filter_attempt = 0
+        while True:
+            # 2. sample batch from replay buffer
+            with marked_timer("gen", timing_raw, color="red"):
+                self.on_sample_begin()
+                batch, off_policy_metrics = self.replay_buffer.sample(
+                    global_steps=self.global_steps,
+                    partition_id="train",
+                    batch_size=self.config.data.train_batch_size,
+                )
+                metrics.update(off_policy_metrics)
+                batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+                self.on_sample_end()
+
+            # 3. [OPTIONAL] compute reward score with colocated reward model
+            if self.reward_loop_manager.reward_loop_worker_handles is None:
+                with marked_timer("reward", timing_raw, color="yellow"):
+                    batch = self._compute_reward_colocate(batch, metrics=metrics)
+            self._record_prompt_reward_before_expand(batch, metrics)
+
+            filtered_batch = self._filter_reward_std_groups(batch, metrics)
+            if filtered_batch is not None:
+                batch = filtered_batch
+                break
+
+            reward_filter_attempt += 1
+            metrics["online_filter/retry_batches"] = float(reward_filter_attempt)
+            logger.warning(
+                "Online reward-std filtering dropped a whole sampled batch at step %s; sampling another batch.",
+                self.global_steps,
+            )
+
+        # 4. balance batch across data parallel groups
+        batch = self._balance_batch(batch, metrics=metrics)
+
+        # 5. compute old_log_prob
+        with marked_timer("old_log_prob", timing_raw, color="blue"):
+            batch = self._compute_old_log_prob(batch, metrics=metrics)
+
+        # 6. [OPTIONAL] compute ref_log_prob
+        if self.use_reference_policy:
+            with marked_timer("ref", timing_raw, color="olive"):
+                batch = self._compute_ref_log_prob(batch, metrics=metrics)
+
+        # 7. [OPTIONAL] compute critic values
+        if self.use_critic:
+            with marked_timer("values", timing_raw, color="cyan"):
+                batch = self._compute_values(batch, metrics=metrics)
+
+        # 8. compute advantage and return
+        with marked_timer("adv", timing_raw, color="brown"):
+            batch = self._compute_advantage(batch, metrics=metrics)
+
+        # 9. [OPTIONAL] update critic
+        if self.use_critic:
+            with marked_timer("update_critic", timing_raw, color="pink"):
+                batch = self._update_critic(batch, metrics=metrics)
+
+        # 10. update actor
+        if self.config.trainer.critic_warmup <= self.global_steps:
+            with marked_timer("update_actor", timing_raw, color="red"):
+                batch = self._update_actor(batch, metrics=metrics)
+
+        return batch
+
+    def _reward_std_filter_enabled(self) -> bool:
+        filter_cfg = self.config.algorithm.get("filter_groups", None)
+        if not filter_cfg or not filter_cfg.get("enable", False):
+            return False
+
+        metric = filter_cfg.get("metric", "seq_reward")
+        if metric not in (None, "seq_reward", "seq_final_reward", "reward", "score"):
+            logger.warning(
+                "algorithm.filter_groups is enabled with metric=%r; fully_async online filtering currently "
+                "uses sequence rewards from rm_scores.",
+                metric,
+            )
+        return True
+
+    @staticmethod
+    def _split_prompt_and_rollout_key(key: str, tag: dict) -> tuple[str, str]:
+        parts = key.rsplit("_", 2)
+        if len(parts) == 3:
+            prompt_key, session_id, _ = parts
+            fallback_rollout_key = f"{prompt_key}_{session_id}"
+        else:
+            prompt_key = key
+            fallback_rollout_key = key
+        return prompt_key, str(tag.get("rollout_group_id", fallback_rollout_key))
+
+    def _filter_reward_std_groups(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta | None:
+        """Drop prompt groups whose rollout rewards have zero std before trainer forward work."""
+        try:
+            data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=["rm_scores"])
+            rm_scores = data.to_padded_tensor()["rm_scores"]
+        except Exception:
+            logger.warning("algorithm.filter_groups is enabled, but rm_scores are unavailable; skipping filter.")
+            return batch
+
+        sequence_rewards = rm_scores.detach().float().sum(dim=-1).cpu()
+        raw_tags = batch.tags or []
+        row_tags = [
+            raw_tags[i] if i < len(raw_tags) and isinstance(raw_tags[i], dict) else {} for i in range(len(batch.keys))
+        ]
+        prompt_rows: dict[str, list[int]] = defaultdict(list)
+        prompt_rollout_rewards: dict[str, dict[str, float]] = defaultdict(dict)
+        bad_prompts: set[str] = set()
+
+        for i, key in enumerate(batch.keys):
+            tag = row_tags[i]
+            if tag.get("is_padding", False):
+                continue
+
+            key_str = str(key)
+            prompt_key, rollout_key = self._split_prompt_and_rollout_key(key_str, tag)
+            prompt_rows[prompt_key].append(i)
+
+            if i >= sequence_rewards.numel():
+                bad_prompts.add(prompt_key)
+                continue
+            reward = float(sequence_rewards[i].item())
+            if not math.isfinite(reward):
+                bad_prompts.add(prompt_key)
+                continue
+            # GUI multi-turn rows from one rollout share the episode reward; count that rollout once.
+            prompt_rollout_rewards[prompt_key][rollout_key] = reward
+
+        keep_prompts: set[str] = set()
+        reward_stds: list[float] = []
+        for prompt_key, rollout_rewards in prompt_rollout_rewards.items():
+            rewards = list(rollout_rewards.values())
+            if prompt_key in bad_prompts or len(rewards) < 2:
+                reward_stds.append(0.0)
+                continue
+            reward_tensor = torch.tensor(rewards, dtype=torch.float32)
+            reward_std = float(torch.std(reward_tensor, unbiased=False).item())
+            reward_stds.append(reward_std)
+            if reward_std > 0.0:
+                keep_prompts.add(prompt_key)
+
+        kept_indices = [i for prompt_key in keep_prompts for i in prompt_rows.get(prompt_key, [])]
+        kept_indices.sort()
+        kept_keys = [batch.keys[i] for i in kept_indices]
+        kept_tags = [row_tags[i] for i in kept_indices]
+        kept_index_set = set(kept_indices)
+        dropped_keys = [key for i, key in enumerate(batch.keys) if i not in kept_index_set]
+
+        total_prompts = len(prompt_rows)
+        kept_prompts = len(keep_prompts)
+        metrics["online_filter/reward_std/enabled"] = 1.0
+        metrics["online_filter/reward_std/prompts_total"] = float(total_prompts)
+        metrics["online_filter/reward_std/prompts_kept"] = float(kept_prompts)
+        metrics["online_filter/reward_std/prompts_dropped"] = float(max(total_prompts - kept_prompts, 0))
+        metrics["online_filter/reward_std/prompt_keep_frac"] = float(kept_prompts) / max(total_prompts, 1)
+        metrics["online_filter/reward_std/rows_total"] = float(len(batch.keys))
+        metrics["online_filter/reward_std/rows_kept"] = float(len(kept_keys))
+        metrics["online_filter/reward_std/rows_dropped"] = float(len(dropped_keys))
+        if reward_stds:
+            metrics["online_filter/reward_std/mean"] = float(sum(reward_stds)) / len(reward_stds)
+            metrics["online_filter/reward_std/max"] = float(max(reward_stds))
+            metrics["online_filter/reward_std/min"] = float(min(reward_stds))
+
+        if dropped_keys:
+            try:
+                from verl.utils.transferqueue_image_dedup import clear_images, fetch_image_ids
+
+                dropped_image_ids = fetch_image_ids(dropped_keys, batch.partition_id)
+                clear_images(dropped_image_ids)
+                pending_image_keys = getattr(self.replay_buffer, "_pending_image_keys", None)
+                if isinstance(pending_image_keys, dict) and dropped_image_ids:
+                    pending = pending_image_keys.get(batch.partition_id, [])
+                    dropped_image_set = set(dropped_image_ids)
+                    pending_image_keys[batch.partition_id] = [key for key in pending if key not in dropped_image_set]
+            except Exception:
+                logger.debug("Failed to clear images for reward-std filtered rows", exc_info=True)
+            tq.kv_clear(partition_id=batch.partition_id, keys=dropped_keys)
+
+        if not kept_keys:
+            return None
+
+        filtered = KVBatchMeta(partition_id=batch.partition_id, keys=kept_keys, tags=kept_tags)
+        filtered.extra_info.update(batch.extra_info)
+        return filtered
 
     def on_step_end(self):
         # Pause the feeder around the periodic standalone weight sync so it does not dispatch prompts

@@ -1268,6 +1268,25 @@ class AgentLoopManager:
         if rollout_node_resource and rollout_node_resource.strip().lower() in {"0", "false", "none", "null", "off"}:
             rollout_node_resource = None
         node_ids = [node["NodeID"] for node in ray.nodes() if node["Alive"] and node["Resources"].get("CPU", 0) > 0]
+        if rollout_node_resource:
+            matched_nodes = [
+                node["NodeID"]
+                for node in ray.nodes()
+                if node["Alive"] and node["Resources"].get(rollout_node_resource, 0) > 0
+            ]
+            if not matched_nodes:
+                raise RuntimeError(
+                    f"VERL_ROLLOUT_NODE_RESOURCE={rollout_node_resource!r}, but no alive Ray node advertises "
+                    "that custom resource. Set it in `ray start --resources=...`, or disable placement pinning "
+                    "with VERL_ROLLOUT_NODE_RESOURCE=none."
+                )
+            print(
+                "[AGENT_PLACEMENT] AgentLoopWorkers pinned: "
+                f"num_workers={num_workers} resource={rollout_node_resource} nodes={matched_nodes}",
+                flush=True,
+            )
+        else:
+            print(f"[AGENT_PLACEMENT] AgentLoopWorkers round-robin over nodes: {node_ids}", flush=True)
         for i in range(num_workers):
             worker_options = {"name": f"agent_loop_worker_{i}" + f"_{uuid4().hex[:8]}"}
             if rollout_node_resource:

@@ -68,6 +68,28 @@ def run_ppo(config, task_runner_class) -> None:
                 runtime_env_vars["TRANSFER_QUEUE_ENABLE"] = "1"
             runtime_env_kwargs["env_vars"] = runtime_env_vars
 
+        # `ray job submit --runtime-env=...` applies env vars to the driver, but
+        # verl creates a second Ray runtime_env for its actors. Forward placement
+        # and TransferQueue settings so rollout-side actors and storage actors see
+        # the same node-resource policy as the driver.
+        runtime_env_vars = runtime_env_kwargs.get("env_vars", {})
+        if isinstance(runtime_env_vars, DictConfig):
+            with open_dict(runtime_env_vars):
+                for key, value in os.environ.items():
+                    if key.startswith("VERL_TQ_") or key in {
+                        "VERL_ROLLOUT_NODE_RESOURCE",
+                        "VERL_TRAIN_NODE_RESOURCE",
+                    }:
+                        runtime_env_vars[key] = value
+        else:
+            for key, value in os.environ.items():
+                if key.startswith("VERL_TQ_") or key in {
+                    "VERL_ROLLOUT_NODE_RESOURCE",
+                    "VERL_TRAIN_NODE_RESOURCE",
+                }:
+                    runtime_env_vars[key] = value
+        runtime_env_kwargs["env_vars"] = runtime_env_vars
+
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
         print(f"ray init kwargs: {ray_init_kwargs}")
