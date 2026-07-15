@@ -57,6 +57,8 @@ from verl.workers.utils.losses import ppo_loss
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+_TRAIN_MEM_DEBUG_BATCH_COUNT = 0
+
 
 def _with_routing_replay_flag(enabled: bool):
     """Decorator to set 'enable_routing_replay' flag on the data TensorDict."""
@@ -74,7 +76,24 @@ def _with_routing_replay_flag(enabled: bool):
 
 
 def _train_mem_debug_enabled() -> bool:
-    return os.getenv("VERL_TRAIN_MEM_DEBUG", "0").lower() in {"1", "true", "yes", "on"}
+    if os.getenv("VERL_TRAIN_MEM_DEBUG", "0").lower() not in {"1", "true", "yes", "on"}:
+        return False
+    ranks = os.getenv("VERL_TRAIN_MEM_DEBUG_RANKS", "all").strip().lower()
+    if ranks in {"", "all", "*"} or not torch.distributed.is_initialized():
+        return True
+    allowed = {int(value.strip()) for value in ranks.split(",") if value.strip()}
+    return torch.distributed.get_rank() in allowed
+
+
+def _claim_train_mem_debug_batch() -> bool:
+    global _TRAIN_MEM_DEBUG_BATCH_COUNT
+    if not _train_mem_debug_enabled():
+        return False
+    max_batches = int(os.getenv("VERL_TRAIN_MEM_DEBUG_MAX", "8"))
+    if _TRAIN_MEM_DEBUG_BATCH_COUNT >= max_batches:
+        return False
+    _TRAIN_MEM_DEBUG_BATCH_COUNT += 1
+    return True
 
 
 def _tensor_logical_nbytes(tensor: torch.Tensor) -> int:
@@ -151,8 +170,6 @@ def _summarize_tensor_data(obj: object) -> tuple[int, int, int, int, list[tuple[
 
 
 def _log_train_batch_data_memory(data: TensorDict, label: str) -> None:
-    if not _train_mem_debug_enabled():
-        return
     logical_total, logical_cuda, storage_total, storage_cuda, top_tensors = _summarize_tensor_data(data)
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
     local_rank = os.getenv("LOCAL_RANK", "?")
@@ -445,22 +462,23 @@ class TrainingWorker(Worker, DistProfilerExtension):
             if key not in data.keys():
                 tu.assign_non_tensor(data, **{key: val})
 
-        _log_train_batch_data_memory(data, "TrainingWorker.train_batch.input")
-        if _train_mem_debug_enabled():
+        debug_train_mem = _claim_train_mem_debug_batch()
+        if debug_train_mem:
+            _log_train_batch_data_memory(data, "TrainingWorker.train_batch.input")
             log_gpu_memory_usage("[TRAIN_MEM] TrainingWorker.train_batch.before_train_mode", logger=None, rank=None)
 
         with (
             self.engine.train_mode(disable_auto_offload=disable_auto_offload),
             Timer(name="train_batch", logger=None) as timer,
         ):
-            if _train_mem_debug_enabled():
+            if debug_train_mem:
                 log_gpu_memory_usage(
                     "[TRAIN_MEM] TrainingWorker.train_batch.entered_train_mode_before_engine_train_batch",
                     logger=None,
                     rank=None,
                 )
             output = self.engine.train_batch(data, loss_function=self.loss_fn)
-            if _train_mem_debug_enabled():
+            if debug_train_mem:
                 log_gpu_memory_usage(
                     "[TRAIN_MEM] TrainingWorker.train_batch.after_engine_train_batch",
                     logger=None,

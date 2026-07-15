@@ -13,11 +13,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 from typing import Optional
 
 import torch
 from torch.nested._internal.nested_tensor import NestedTensor
 
+from verl.utils.device import get_torch_device
 from verl.utils.megatron_utils import unwrap_model
 from verl.workers.config import MtpConfig
 
@@ -33,6 +35,70 @@ from .util import (
     preprocess_packed_seqs,
     preprocess_thd_engine,
 )
+
+_BSHD_MEM_DEBUG_COUNT: dict[int, int] = {}
+
+
+def _should_log_bshd_memory() -> bool:
+    if os.getenv("VERL_TRAIN_MEM_DEBUG", "0").lower() not in {"1", "true", "yes", "on"}:
+        return False
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    ranks = os.getenv("VERL_TRAIN_MEM_DEBUG_RANKS", "all").strip().lower()
+    if ranks not in {"", "all", "*"}:
+        allowed = {int(value.strip()) for value in ranks.split(",") if value.strip()}
+        if rank not in allowed:
+            return False
+    max_events = int(os.getenv("VERL_TRAIN_MEM_DEBUG_MAX", "8"))
+    count = _BSHD_MEM_DEBUG_COUNT.get(rank, 0)
+    if count >= max_events:
+        return False
+    _BSHD_MEM_DEBUG_COUNT[rank] = count + 1
+    return True
+
+
+def _language_model_and_weight(model):
+    root = unwrap_model(model)
+    language_model = getattr(root, "language_model", root)
+    output_layer = getattr(language_model, "output_layer", None)
+    weight = getattr(output_layer, "weight", None)
+    return language_model, weight if isinstance(weight, torch.Tensor) else None
+
+
+def _log_bshd_memory(model, input_ids, input_ids_bshd, multi_modal_inputs: dict) -> None:
+    if not _should_log_bshd_memory():
+        return
+
+    lengths = input_ids.offsets().diff()
+    effective_tokens = int(lengths.sum().item())
+    padded_tokens = int(input_ids_bshd.numel())
+    amplification = padded_tokens / max(effective_tokens, 1)
+    language_model, weight = _language_model_and_weight(model)
+    local_vocab = int(weight.shape[0]) if weight is not None else 0
+    config = getattr(language_model, "config", None)
+    sequence_parallel = bool(getattr(config, "sequence_parallel", False))
+    tp_size = int(getattr(config, "tensor_model_parallel_size", 1))
+    lm_head_positions = padded_tokens // tp_size if sequence_parallel else padded_tokens
+    logits_gib = lm_head_positions * local_vocab * (weight.element_size() if weight is not None else 0) / 1024**3
+    mm_parts = []
+    for key, value in multi_modal_inputs.items():
+        if isinstance(value, torch.Tensor):
+            mm_parts.append(f"{key}={value.numel() * value.element_size() / 1024**3:.3f}GiB:{tuple(value.shape)}")
+
+    device = get_torch_device()
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    print(
+        "[TRAIN_MEM][BSHD] "
+        f"rank={rank} rows={len(lengths)} effective_tokens={effective_tokens} "
+        f"min_len={int(lengths.min().item())} max_len={int(lengths.max().item())} "
+        f"padded_shape={tuple(input_ids_bshd.shape)} padded_tokens={padded_tokens} "
+        f"padding_amplification={amplification:.3f}x local_vocab={local_vocab} "
+        f"sequence_parallel={sequence_parallel} tp_size={tp_size} lm_head_positions={lm_head_positions} "
+        f"projected_logits_gib={logits_gib:.3f} "
+        f"allocated_gib={device.memory_allocated() / 1024**3:.3f} "
+        f"reserved_gib={device.memory_reserved() / 1024**3:.3f} "
+        f"multimodal=[{'; '.join(mm_parts)}]",
+        flush=True,
+    )
 
 
 def model_forward_gen(vision_model: bool = False):
@@ -417,6 +483,8 @@ def gptmodel_forward_model_engine(
             input_ids_bshd, attention_mask = build_vlm_attn_mask_bshd(input_ids, batch_size, pad_token_id)
         else:
             attention_mask = attention_mask_bshd
+
+        _log_bshd_memory(model, input_ids, input_ids_bshd, multi_modal_inputs)
 
         output_orig = model(
             input_ids=input_ids_bshd,

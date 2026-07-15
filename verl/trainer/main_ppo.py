@@ -45,6 +45,13 @@ def _job_runtime_env_var_keys() -> set[str]:
     return set(env_vars) if isinstance(env_vars, dict) else set()
 
 
+def _should_forward_runtime_env_var(key: str) -> bool:
+    return key.startswith(("VERL_TQ_", "VERL_TRAIN_MEM_")) or key in {
+        "VERL_ROLLOUT_NODE_RESOURCE",
+        "VERL_TRAIN_NODE_RESOURCE",
+    }
+
+
 # Define a function to run the PPO-like training process
 def run_ppo(config, task_runner_class) -> None:
     """Initialize Ray cluster and run distributed PPO training process.
@@ -95,13 +102,13 @@ def run_ppo(config, task_runner_class) -> None:
                 for key, value in os.environ.items():
                     if key in job_runtime_env_keys:
                         continue
-                    if key.startswith("VERL_TQ_") or key in {"VERL_ROLLOUT_NODE_RESOURCE", "VERL_TRAIN_NODE_RESOURCE"}:
+                    if _should_forward_runtime_env_var(key):
                         runtime_env_vars[key] = value
         else:
             for key, value in os.environ.items():
                 if key in job_runtime_env_keys:
                     continue
-                if key.startswith("VERL_TQ_") or key in {"VERL_ROLLOUT_NODE_RESOURCE", "VERL_TRAIN_NODE_RESOURCE"}:
+                if _should_forward_runtime_env_var(key):
                     runtime_env_vars[key] = value
         runtime_env_kwargs["env_vars"] = runtime_env_vars
 
