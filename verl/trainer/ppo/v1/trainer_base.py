@@ -155,6 +155,7 @@ class PPOTrainer(ABC):
         self._init_dump_executor()
         self._init_resource_pool_mgr()
         self.resource_pool_manager.create_resource_pool()
+        self._pin_training_resource_pool()
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
         # 1. define actor and rollout class
@@ -634,6 +635,35 @@ class PPOTrainer(ABC):
             self.mapping[Role.TeacherModel] = "teacher_pool"
 
         self.resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=self.mapping)
+
+    def _pin_training_resource_pool(self) -> None:
+        """Pin the trainer GPU placement groups to a tagged Ray node when configured."""
+        resource_name = (os.getenv("VERL_TRAIN_NODE_RESOURCE") or "").strip()
+        if resource_name.lower() in {"", "0", "false", "none", "null", "off"}:
+            return
+
+        matched_nodes = [node for node in ray.nodes() if node["Alive"] and node["Resources"].get(resource_name, 0) > 0]
+        if len(matched_nodes) < self.config.trainer.nnodes:
+            matched = [node["NodeManagerAddress"] for node in matched_nodes]
+            raise RuntimeError(
+                f"VERL_TRAIN_NODE_RESOURCE={resource_name!r} requires {self.config.trainer.nnodes} trainer "
+                f"node(s), but only {len(matched_nodes)} alive Ray node(s) advertise it: {matched}. "
+                "Set the custom resource in `ray start --resources=...`, or disable trainer placement "
+                "pinning with VERL_TRAIN_NODE_RESOURCE=none."
+            )
+
+        # RayResourcePool adds this custom resource to every GPU bundle. The name
+        # `accelerator_type` is historical; it accepts any Ray custom resource.
+        training_pool = self.resource_pool_manager.resource_pool_dict["global_pool"]
+        training_pool.accelerator_type = resource_name
+        matched = [node["NodeManagerAddress"] for node in matched_nodes]
+        print(
+            "[TRAIN_PLACEMENT] Trainer global_pool pinned: "
+            f"nnodes={self.config.trainer.nnodes} "
+            f"n_gpus_per_node={self.config.trainer.n_gpus_per_node} "
+            f"resource={resource_name} nodes={matched}",
+            flush=True,
+        )
 
     def _load_checkpoint(self):
         self.global_steps = 0
