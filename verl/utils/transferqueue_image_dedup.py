@@ -448,7 +448,7 @@ class ImageLRU:
 # ---------------------------------------------------------------------------
 # Consume-side resolution (worker materialization hook helper)
 # ---------------------------------------------------------------------------
-async def resolve_image_ids(
+def resolve_image_ids(
     tensordict: Any,
     *,
     partition: str = PARTITION_IMAGES,
@@ -561,7 +561,7 @@ async def resolve_image_ids(
     if needed:
         # Each key is a single image; a multi-key get is jagged (heterogeneous
         # shapes), so ``unbind()[i]`` yields each image at its native shape.
-        td = await tq.async_kv_batch_get(keys=needed, partition_id=partition)
+        td = tq.kv_batch_get(keys=needed, partition_id=partition)
         new_payloads: dict[str, dict[str, Any]] = {k: {} for k in needed}
         _dbg_collen = {}
         for fname in td.keys():
@@ -715,8 +715,8 @@ _IMAGE_LRU_MAXSIZE = int(os.getenv("VERL_IMAGE_LRU_MAXSIZE", "0"))
 _WORKER_IMAGE_LRU: ImageLRU | None = None
 
 
-async def maybe_resolve_image_ids(tensordict: Any) -> Any:
-    """Consume-side hook: resolve a deduped ``image_ids`` column into ``multi_modal_inputs``.
+def resolve_image_ids_if_present(tensordict: Any) -> Any:
+    """Synchronously resolve a deduped ``image_ids`` column into ``multi_modal_inputs``.
 
     Called once per worker materialization from
     :func:`verl.utils.transferqueue_utils._async_meta_to_realdata`. A no-op unless
@@ -731,11 +731,16 @@ async def maybe_resolve_image_ids(tensordict: Any) -> Any:
     if _IMAGE_LRU_MAXSIZE <= 0:
         # Persistent cache disabled: cache=None -> resolve_image_ids builds a fresh per-call cache
         # (dedups within this batch, freed on return). No cross-step accumulation.
-        return await resolve_image_ids(tensordict, cache=None)
+        return resolve_image_ids(tensordict, cache=None)
     global _WORKER_IMAGE_LRU
     if _WORKER_IMAGE_LRU is None:
         _WORKER_IMAGE_LRU = ImageLRU(maxsize=_IMAGE_LRU_MAXSIZE)
-    return await resolve_image_ids(tensordict, cache=_WORKER_IMAGE_LRU)
+    return resolve_image_ids(tensordict, cache=_WORKER_IMAGE_LRU)
+
+
+async def maybe_resolve_image_ids(tensordict: Any) -> Any:
+    """Async-compatible wrapper for the synchronous worker materialization path."""
+    return resolve_image_ids_if_present(tensordict)
 
 
 # ---------------------------------------------------------------------------

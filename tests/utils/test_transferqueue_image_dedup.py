@@ -11,18 +11,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for the pure tensor helpers of TransferQueue image dedup.
+"""Unit tests for TransferQueue image dedup helpers.
 
 These exercise content hashing, per-image splitting and per-row reconstruction
 without a running TransferQueue (no ``transfer_queue`` / GPU required).
 """
 
-import torch
+import asyncio
+import sys
+from types import SimpleNamespace
 
+import torch
+from tensordict import TensorDict
+
+from verl.utils.tensordict_utils import assign_non_tensor_stack
 from verl.utils.transferqueue_image_dedup import (
     content_key,
     decode_image_ids,
     encode_image_ids,
+    maybe_resolve_image_ids,
     reconstruct_row_multimodal,
     split_multimodal_per_image,
 )
@@ -159,6 +166,34 @@ def test_image_ids_string_encoding_roundtrip():
     assert decode_image_ids(["k0", "k1"]) == ["k0", "k1"]
     assert decode_image_ids([]) == []
     assert decode_image_ids(None) == []
+
+
+def test_async_wrapper_uses_sync_kv_get_inside_running_loop(monkeypatch):
+    """Ray async actors can call the resolver while an event loop is running."""
+    image = _image((1, 2, 2), fill=3.0)
+    [image_id], _ = split_multimodal_per_image(image)
+    payload = TensorDict(
+        {
+            "pixel_values": image["pixel_values"].unsqueeze(0),
+            "image_grid_thw": image["image_grid_thw"].unsqueeze(0),
+        },
+        batch_size=(1,),
+    )
+    fake_tq = SimpleNamespace(
+        kv_list=lambda: {"__verl_images__": {image_id: {}}},
+        kv_batch_get=lambda **_: payload,
+    )
+    monkeypatch.setitem(sys.modules, "transfer_queue", fake_tq)
+
+    batch = TensorDict({}, batch_size=(1,))
+    assign_non_tensor_stack(batch, "image_ids", [encode_image_ids([image_id])])
+    resolved = asyncio.run(maybe_resolve_image_ids(batch))
+
+    assert "image_ids" not in resolved.keys()
+    rebuilt = resolved["multi_modal_inputs"][0]
+    rebuilt = rebuilt.data if hasattr(rebuilt, "data") else rebuilt
+    assert torch.equal(rebuilt["pixel_values"], image["pixel_values"])
+    assert torch.equal(rebuilt["image_grid_thw"], image["image_grid_thw"])
 
 
 def test_namespace_dedups_within_but_isolates_across_sessions():

@@ -663,10 +663,12 @@ class MegatronEngine(BaseEngine):
         lazy_mm_log_max = int(os.getenv("VERL_LAZY_MM_LOG_MAX", "8"))
         if lazy_multimodal and _LAZY_MM_LOG_COUNT < lazy_mm_log_max and torch.distributed.get_rank() == 0:
             _LAZY_MM_LOG_COUNT += 1
+            microbatch_rows = [len(micro_batch) for micro_batch in micro_batches]
             print(
                 "[LAZY_MM] deferred image resolution enabled: "
                 f"dp_shard_rows={len(data)} microbatches={len(micro_batches)} "
-                f"microbatch_rows={[len(micro_batch) for micro_batch in micro_batches]}",
+                f"microbatch_rows_min={min(microbatch_rows, default=0)} "
+                f"microbatch_rows_max={max(microbatch_rows, default=0)}",
                 flush=True,
             )
 

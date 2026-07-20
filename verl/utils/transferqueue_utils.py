@@ -198,16 +198,13 @@ def _meta_to_realdata(meta: BatchMeta) -> TensorDict:
 
 def materialize_deferred_image_ids(tensordict: TensorDict) -> TensorDict:
     """Resolve image references for one already-fetched training microbatch."""
-    from verl.utils.transferqueue_image_dedup import maybe_resolve_image_ids
+    from verl.utils.transferqueue_image_dedup import resolve_image_ids_if_present
 
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        # Megatron forward runs synchronously. Keep TensorDict mutation on that
-        # same thread; moving an existing TensorDict into the generic temporary
-        # event-loop thread can block on TensorDict's internal synchronization.
-        return asyncio.run(maybe_resolve_image_ids(tensordict))
-    raise RuntimeError("deferred image materialization requires a synchronous training worker thread")
+    # WorkerDict also exposes async weight-sync methods, so Ray may execute this
+    # synchronous training method on its event-loop thread. TransferQueue has a
+    # native synchronous KV API; use it directly instead of nesting an event loop
+    # or moving an existing TensorDict to another thread.
+    return resolve_image_ids_if_present(tensordict)
 
 
 async def _async_update_meta_with_output(output: TensorDict, meta: BatchMeta, func_name=None) -> BatchMeta:
