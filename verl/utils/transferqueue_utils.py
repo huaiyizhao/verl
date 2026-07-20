@@ -120,6 +120,7 @@ async def _async_meta_to_realdata(meta: BatchMeta | KVBatchMeta) -> TensorDict:
     if isinstance(meta, KVBatchMeta):
         meta = await async_kv_batch_meta2batch_meta(meta)
     meta_info = copy.deepcopy(meta.extra_info)
+    defer_image_resolution = bool(meta_info.get("defer_image_resolution", False))
     if meta.size == 0:
         empty_td = TensorDict({}, batch_size=(0,))
         tu.assign_non_tensor(empty_td, **meta_info)
@@ -141,7 +142,8 @@ async def _async_meta_to_realdata(meta: BatchMeta | KVBatchMeta) -> TensorDict:
     from verl.utils.transferqueue_image_dedup import maybe_resolve_image_ids
 
     _t = time.perf_counter()
-    tensordict = await maybe_resolve_image_ids(tensordict)
+    if not defer_image_resolution:
+        tensordict = await maybe_resolve_image_ids(tensordict)
     t_resolve = time.perf_counter() - _t
 
     if _STEP_PROFILE:
@@ -183,7 +185,8 @@ async def _async_meta_to_realdata(meta: BatchMeta | KVBatchMeta) -> TensorDict:
         print(
             f"[MATERIALIZE_PROFILE] n_rows={n_rows} fields={len(list(tensordict.keys()))} "
             f"data_fetch={t_fetch:.3f}s mm_resolve={t_resolve:.3f}s "
-            f"batch_mm={batch_mm:.1f}G rss={rss:.1f}G gpu_alloc={gpu_a:.1f}G gpu_resv={gpu_r:.1f}G",
+            f"deferred_mm={defer_image_resolution} batch_mm={batch_mm:.1f}G "
+            f"rss={rss:.1f}G gpu_alloc={gpu_a:.1f}G gpu_resv={gpu_r:.1f}G",
             flush=True,
         )
     return tensordict
@@ -191,6 +194,20 @@ async def _async_meta_to_realdata(meta: BatchMeta | KVBatchMeta) -> TensorDict:
 
 def _meta_to_realdata(meta: BatchMeta) -> TensorDict:
     return _run_async_in_temp_loop(_async_meta_to_realdata, meta)
+
+
+def materialize_deferred_image_ids(tensordict: TensorDict) -> TensorDict:
+    """Resolve image references for one already-fetched training microbatch."""
+    from verl.utils.transferqueue_image_dedup import maybe_resolve_image_ids
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # Megatron forward runs synchronously. Keep TensorDict mutation on that
+        # same thread; moving an existing TensorDict into the generic temporary
+        # event-loop thread can block on TensorDict's internal synchronization.
+        return asyncio.run(maybe_resolve_image_ids(tensordict))
+    raise RuntimeError("deferred image materialization requires a synchronous training worker thread")
 
 
 async def _async_update_meta_with_output(output: TensorDict, meta: BatchMeta, func_name=None) -> BatchMeta:

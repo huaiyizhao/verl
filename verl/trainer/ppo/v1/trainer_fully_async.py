@@ -233,19 +233,30 @@ class PPOTrainerFullyAsync(PPOTrainerSeparateAsync):
         # 1. add batch to generate. In fully_async this is a no-op after the feeder starts.
         self._add_batch_to_generate()
 
-        reward_filter_attempt = 0
-        while True:
+        target_prompts = int(self.config.data.train_batch_size)
+        kept_batches: list[KVBatchMeta] = []
+        kept_prompt_keys: set[str] = set()
+        filter_attempts = 0
+        filter_totals: dict[str, float] = defaultdict(float)
+        reward_std_weighted_sum = 0.0
+        reward_std_count = 0.0
+        reward_std_min = math.inf
+        reward_std_max = -math.inf
+
+        while len(kept_prompt_keys) < target_prompts:
+            prompts_needed = target_prompts - len(kept_prompt_keys)
             # 2. sample batch from replay buffer
             with marked_timer("gen", timing_raw, color="red"):
                 self.on_sample_begin()
                 batch, off_policy_metrics = self.replay_buffer.sample(
                     global_steps=self.global_steps,
                     partition_id="train",
-                    batch_size=self.config.data.train_batch_size,
+                    batch_size=prompts_needed,
                 )
                 metrics.update(off_policy_metrics)
                 batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
                 self.on_sample_end()
+            filter_attempts += 1
 
             # 3. [OPTIONAL] compute reward score with colocated reward model
             if self.reward_loop_manager.reward_loop_worker_handles is None:
@@ -253,17 +264,83 @@ class PPOTrainerFullyAsync(PPOTrainerSeparateAsync):
                     batch = self._compute_reward_colocate(batch, metrics=metrics)
             self._record_prompt_reward_before_expand(batch, metrics)
 
-            filtered_batch = self._filter_reward_std_groups(batch, metrics)
-            if filtered_batch is not None:
-                batch = filtered_batch
-                break
+            attempt_metrics: dict[str, float] = {}
+            filtered_batch = self._filter_reward_std_groups(batch, attempt_metrics)
+            metric_prefix = "online_filter/reward_std/"
+            for name in ("prompts_total", "prompts_kept", "prompts_dropped", "rows_total", "rows_kept", "rows_dropped"):
+                filter_totals[name] += attempt_metrics.get(f"{metric_prefix}{name}", 0.0)
 
-            reward_filter_attempt += 1
-            metrics["online_filter/retry_batches"] = float(reward_filter_attempt)
-            logger.warning(
-                "Online reward-std filtering dropped a whole sampled batch at step %s; sampling another batch.",
-                self.global_steps,
+            attempt_prompt_count = attempt_metrics.get(f"{metric_prefix}prompts_total", 0.0)
+            if attempt_prompt_count > 0:
+                reward_std_weighted_sum += attempt_metrics.get(f"{metric_prefix}mean", 0.0) * attempt_prompt_count
+                reward_std_count += attempt_prompt_count
+                reward_std_min = min(reward_std_min, attempt_metrics.get(f"{metric_prefix}min", math.inf))
+                reward_std_max = max(reward_std_max, attempt_metrics.get(f"{metric_prefix}max", -math.inf))
+
+            if filtered_batch is None:
+                print(
+                    f"[ONLINE_FILTER] step={self.global_steps} attempt={filter_attempts} "
+                    f"requested={prompts_needed} kept=0 accumulated={len(kept_prompt_keys)}/{target_prompts}",
+                    flush=True,
+                )
+                logger.warning(
+                    "Online reward-std filtering kept 0/%d requested prompts at step %s; sampling replacements.",
+                    prompts_needed,
+                    self.global_steps,
+                )
+                continue
+
+            batch_prompt_keys = {
+                self._split_prompt_and_rollout_key(str(key), tag)[0]
+                for key, tag in zip(filtered_batch.keys, filtered_batch.tags, strict=True)
+                if not tag.get("is_padding", False)
+            }
+            duplicate_prompts = kept_prompt_keys & batch_prompt_keys
+            if duplicate_prompts:
+                raise RuntimeError(f"online filtering sampled duplicate prompt groups: {sorted(duplicate_prompts)}")
+            if len(batch_prompt_keys) > prompts_needed:
+                raise RuntimeError(
+                    f"online filtering kept {len(batch_prompt_keys)} prompts, but only {prompts_needed} were requested"
+                )
+            kept_prompt_keys.update(batch_prompt_keys)
+            kept_batches.append(filtered_batch)
+            print(
+                f"[ONLINE_FILTER] step={self.global_steps} attempt={filter_attempts} "
+                f"requested={prompts_needed} kept={len(batch_prompt_keys)} "
+                f"accumulated={len(kept_prompt_keys)}/{target_prompts}",
+                flush=True,
             )
+
+            if len(kept_prompt_keys) < target_prompts:
+                logger.info(
+                    "Online reward-std filtering accumulated %d/%d valid prompts at step %s; waiting for %d more.",
+                    len(kept_prompt_keys),
+                    target_prompts,
+                    self.global_steps,
+                    target_prompts - len(kept_prompt_keys),
+                )
+
+        batch = self._concat_filtered_batches(kept_batches)
+        metrics.update(
+            {
+                "online_filter/retry_batches": float(max(filter_attempts - 1, 0)),
+                "online_filter/gen_batches": float(filter_attempts),
+                f"{metric_prefix}enabled": 1.0,
+                f"{metric_prefix}prompts_target": float(target_prompts),
+                f"{metric_prefix}prompts_total": filter_totals["prompts_total"],
+                f"{metric_prefix}prompts_kept": filter_totals["prompts_kept"],
+                f"{metric_prefix}prompts_dropped": filter_totals["prompts_dropped"],
+                f"{metric_prefix}prompt_keep_frac": filter_totals["prompts_kept"]
+                / max(filter_totals["prompts_total"], 1.0),
+                f"{metric_prefix}rows_total": filter_totals["rows_total"],
+                f"{metric_prefix}rows_kept": filter_totals["rows_kept"],
+                f"{metric_prefix}rows_dropped": filter_totals["rows_dropped"],
+            }
+        )
+        if reward_std_count > 0:
+            metrics[f"{metric_prefix}mean"] = reward_std_weighted_sum / reward_std_count
+            metrics[f"{metric_prefix}min"] = reward_std_min
+            metrics[f"{metric_prefix}max"] = reward_std_max
 
         # 4. balance batch across data parallel groups
         batch = self._balance_batch(batch, metrics=metrics)
@@ -297,6 +374,29 @@ class PPOTrainerFullyAsync(PPOTrainerSeparateAsync):
                 batch = self._update_actor(batch, metrics=metrics)
 
         return batch
+
+    @staticmethod
+    def _concat_filtered_batches(batches: list[KVBatchMeta]) -> KVBatchMeta:
+        """Combine replacement samples after filtering without materializing their TQ payloads."""
+        if not batches:
+            raise RuntimeError("online filtering produced no valid prompt batches")
+        if len(batches) == 1:
+            return batches[0]
+
+        partition_id = batches[0].partition_id
+        keys: list[str] = []
+        tags: list[dict] = []
+        for batch in batches:
+            if batch.partition_id != partition_id:
+                raise RuntimeError(
+                    f"online filtering cannot combine partitions {partition_id!r} and {batch.partition_id!r}"
+                )
+            keys.extend(batch.keys)
+            tags.extend(batch.tags)
+
+        combined = KVBatchMeta(partition_id=partition_id, keys=keys, tags=tags)
+        combined.extra_info.update(batches[0].extra_info)
+        return combined
 
     def _reward_std_filter_enabled(self) -> bool:
         filter_cfg = self.config.algorithm.get("filter_groups", None)

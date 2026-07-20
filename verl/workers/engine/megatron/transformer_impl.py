@@ -64,6 +64,7 @@ from verl.utils.megatron_utils import (
 )
 from verl.utils.model import extract_multi_modal_inputs, load_mcore_dist_weights
 from verl.utils.seqlen_balancing import restore_dynamic_batch
+from verl.utils.transferqueue_utils import materialize_deferred_image_ids
 from verl.workers.config import HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
 
 from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
@@ -72,6 +73,8 @@ from .utils import set_random_seed
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+_LAZY_MM_LOG_COUNT = 0
 
 
 class MegatronEngine(BaseEngine):
@@ -631,6 +634,7 @@ class MegatronEngine(BaseEngine):
             offload_megatron_optimizer(self.optimizer)
 
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> Any:
+        lazy_multimodal = "image_ids" in data.keys()
         tu.assign_non_tensor(data, sp_size=self.engine_config.context_parallel_size)
 
         # compute num_tokens in global batch for loss normalization
@@ -654,6 +658,17 @@ class MegatronEngine(BaseEngine):
             same_micro_num_in_dp=True,
             min_num_micro_batch=None,
         )
+
+        global _LAZY_MM_LOG_COUNT
+        lazy_mm_log_max = int(os.getenv("VERL_LAZY_MM_LOG_MAX", "8"))
+        if lazy_multimodal and _LAZY_MM_LOG_COUNT < lazy_mm_log_max and torch.distributed.get_rank() == 0:
+            _LAZY_MM_LOG_COUNT += 1
+            print(
+                "[LAZY_MM] deferred image resolution enabled: "
+                f"dp_shard_rows={len(data)} microbatches={len(micro_batches)} "
+                f"microbatch_rows={[len(micro_batch) for micro_batch in micro_batches]}",
+                flush=True,
+            )
 
         if num_batches_divided_by is not None:
             assert len(micro_batches) % num_batches_divided_by == 0, (
@@ -845,6 +860,14 @@ class MegatronEngineWithLMHead(MegatronEngine):
         self, batch_iter: Iterator[TensorDict], model, logits_processor_func, postprocess_micro_batch_func
     ):
         batch: TensorDict = next(batch_iter)
+
+        # The TQ bridge can leave raw image references unresolved for actor
+        # updates. Resolve a shallow microbatch copy here, after Megatron has
+        # performed its real microbatch split. The unresolved source remains in
+        # the iterator, so completed microbatches do not accumulate pixel tensors.
+        if "image_ids" in batch.keys():
+            batch = batch.clone(recurse=False)
+            batch = materialize_deferred_image_ids(batch)
 
         if self.engine_config.dynamic_context_parallel:
             # split the batch and give the sub-batches to each dp-cp group

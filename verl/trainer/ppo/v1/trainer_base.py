@@ -1417,6 +1417,8 @@ class PPOTrainer(ABC):
                 "temperature": self.config.actor_rollout_ref.rollout.temperature,
             }
         )
+        if self.config.actor_rollout_ref.actor.strategy == "megatron":
+            batch.extra_info["defer_image_resolution"] = True
         output: KVBatchMeta = self.actor_rollout_wg.compute_log_prob(batch)
         assert len(output) == len(batch)
 
@@ -1464,6 +1466,13 @@ class PPOTrainer(ABC):
         }
         if self.ref_in_actor:
             metadata["no_lora_adapter"] = True
+        ref_strategy = (
+            self.config.actor_rollout_ref.actor.strategy
+            if self.ref_in_actor
+            else self.config.actor_rollout_ref.ref.strategy
+        )
+        if ref_strategy == "megatron":
+            metadata["defer_image_resolution"] = True
         batch.extra_info.update(metadata)
         if self.ref_in_actor:
             output = self.actor_rollout_wg.compute_log_prob(batch)
@@ -1659,6 +1668,10 @@ class PPOTrainer(ABC):
             "dataloader_kwargs": {"shuffle": self.config.actor_rollout_ref.actor.shuffle},
             "temperature": self.config.actor_rollout_ref.rollout.temperature,
         }
+        if self.config.actor_rollout_ref.actor.strategy == "megatron":
+            # Keep image_ids lightweight through TQ/DP dispatch. Megatron resolves
+            # them only after it has split the true per-GPU microbatches.
+            extra_info["defer_image_resolution"] = True
         if os.getenv("VERL_LOGPROB_PROBE_DUMP", "0") not in ("0", "false", "False", ""):
             extra_info.update(
                 {
