@@ -264,23 +264,42 @@ class ImageDedupManagerTQ(RolloutAgentLoopManagerTQ):
 # Lifecycle: release deduped images as rows leave the replay buffer
 # ---------------------------------------------------------------------------
 class ImageDedupReplayBuffer(SessionReplayBuffer):
-    """SessionReplayBuffer that refcount-GCs deduped images.
+    """SessionReplayBuffer that lifecycle-GCs session-owned deduped images.
 
     Select with ``trainer.v1.sampler.custom_sampler.{path,name}``.
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # image keys of the last-sampled (now consumed) batch, per partition
+        # Image keys sampled for the current trainer step, per partition. Online
+        # filtering may issue several sample() calls before one actor update.
         self._pending_image_keys: dict[str, list[str]] = {}
+        self._accumulating_image_partitions: set[str] = set()
+
+    def begin_image_accumulation(self, partition_id: str) -> None:
+        """Keep images from repeated sample calls until the trainer step finishes."""
+        if partition_id in self._accumulating_image_partitions:
+            raise RuntimeError(f"image accumulation already active for partition {partition_id!r}")
+        # Defensive cleanup for a previously interrupted step.
+        clear_images(self._pending_image_keys.pop(partition_id, []))
+        self._accumulating_image_partitions.add(partition_id)
+
+    def release_sampled_images(self, partition_id: str) -> None:
+        """Release all images retained by the completed trainer step."""
+        clear_images(self._pending_image_keys.pop(partition_id, []))
+        self._accumulating_image_partitions.discard(partition_id)
 
     def sample(self, global_steps: int, partition_id: str, batch_size: int):
         batch, metrics = super().sample(global_steps, partition_id, batch_size)
-        # The previously-sampled batch for this partition has been consumed and
-        # cleared by the fit loop by now -> clear its (session-owned) images.
-        clear_images(self._pending_image_keys.pop(partition_id, []))
         # Capture this batch's image refs while its rows are still alive.
-        self._pending_image_keys[partition_id] = fetch_image_ids(batch.keys, batch.partition_id)
+        image_keys = fetch_image_ids(batch.keys, batch.partition_id)
+        if partition_id in self._accumulating_image_partitions:
+            self._pending_image_keys.setdefault(partition_id, []).extend(image_keys)
+        else:
+            # Backward-compatible lifecycle for callers that do one sample per
+            # update and have not opted into explicit step accumulation.
+            clear_images(self._pending_image_keys.pop(partition_id, []))
+            self._pending_image_keys[partition_id] = image_keys
         return batch, metrics
 
     def _drop_max_off_policy_samples(

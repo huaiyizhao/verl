@@ -225,9 +225,21 @@ class PPOTrainerFullyAsync(PPOTrainerSeparateAsync):
         # fail fast instead of hanging in replay_buffer.sample if the feeder died
         if self._feeder_error:
             raise RuntimeError("Streaming feeder thread died; aborting training")
-        if not self._reward_std_filter_enabled():
-            return super().step(metrics, timing_raw)
-        return self._step_with_reward_std_filter(metrics, timing_raw)
+
+        begin_images = getattr(self.replay_buffer, "begin_image_accumulation", None)
+        release_images = getattr(self.replay_buffer, "release_sampled_images", None)
+        if begin_images is not None:
+            begin_images("train")
+        try:
+            if not self._reward_std_filter_enabled():
+                return super().step(metrics, timing_raw)
+            return self._step_with_reward_std_filter(metrics, timing_raw)
+        finally:
+            # Online filtering performs multiple sample() calls in one trainer
+            # step. Kept batches need their images through ref/actor forwards;
+            # release them only after the whole step has consumed the batch.
+            if release_images is not None:
+                release_images("train")
 
     def _step_with_reward_std_filter(self, metrics: dict, timing_raw: dict) -> KVBatchMeta:
         # 1. add batch to generate. In fully_async this is a no-op after the feeder starts.
